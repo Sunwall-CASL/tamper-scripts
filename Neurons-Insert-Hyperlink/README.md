@@ -10,6 +10,7 @@ Pressing **Cmd+K (Mac)** or **Ctrl+K (Windows)** inside an editable field will o
 ## Installation
 [Install this script](https://Sunwall-CASL.github.io/tamper-scripts/scripts/Neurons-Insert-Hyperlink/neurons-insert-hyperlink.js)
 
+https://raw.githubusercontent.com/Sunwall-CASL/tamper-scripts/refs/heads/main/Neurons-Insert-Hyperlink/neurons-insert-hyperlink.js
 ## Using it
 * Navigate to Neurons
 * Press **Cmd+K (Mac)** or **Ctrl+K (Windows)** inside an editable field
