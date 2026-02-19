@@ -1,5 +1,5 @@
 
-# README for Neurons-CmdK-Hyperlink-Inserter.user.js
+# README for neurons-insert-hyperlink.user.js
 
 ## What it does
 
