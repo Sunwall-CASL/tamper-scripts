@@ -8,7 +8,7 @@ This userscript enhances the rich-text editors on the **Ivanti Neurons ITSM plat
 It adds a custom keyboard shortcut to:
 1.  Open a pop-up window that supports **drag-and-drop image insertion**.
 2.  Insert the dropped image directly into the editor at your cursor position.
-3.  The inserted image is able to be **resized**.
+3.  The inserted image is able to be **resized** with greater flexibility than by default in Neurons.
 
 ## Installation
 
