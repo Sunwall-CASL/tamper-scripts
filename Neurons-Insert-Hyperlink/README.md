@@ -5,10 +5,10 @@
 
 This userscript adds a custom keyboard shortcut to the rich-text editors on the **Ivanti Neurons ITSM platform** (targeting URLs matching `https://uwm-amc.ivanticloud.com/*`).
 
+Pressing **Cmd+K (Mac)** or **Ctrl+K (Windows)** inside an editable field will open a dialog to quickly insert a hyperlink.
+
 ## Installation
 [Install this script](https://raw.githubusercontent.com/Sunwall-CASL/tamper-scripts/refs/heads/main/Neurons-Insert-Hyperlink/neurons-insert-hyperlink.js)
-
-Pressing **Cmd+K (Mac)** or **Ctrl+K (Windows)** inside an editable field will open a dialog to quickly insert a hyperlink.
 
 ## Using it
 * Navigate to Neurons
