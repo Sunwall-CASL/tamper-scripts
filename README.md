@@ -32,4 +32,4 @@ Snippets should work with other userscript runners as long as they provide the s
 * [Export Grades With Emails](scripts/export-grades-with-emails/README.md)
 
 ## For Support
-[Contact CETL](https://uwm.edu/cetl/about/contact/)
+[Contact CETL](https://uwm.edu/advancing-learning/about/contact/)
