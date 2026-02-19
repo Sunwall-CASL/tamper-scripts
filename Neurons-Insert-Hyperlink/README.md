@@ -8,9 +8,8 @@ This userscript adds a custom keyboard shortcut to the rich-text editors on the 
 Pressing **Cmd+K (Mac)** or **Ctrl+K (Windows)** inside an editable field will open a dialog to quickly insert a hyperlink.
 
 ## Installation
-[Install this script](https://Sunwall-CASL.github.io/tamper-scripts/scripts/Neurons-Insert-Hyperlink/neurons-insert-hyperlink.js)
+[Install this script](https://github.com/Sunwall-CASL/tamper-scripts/raw/refs/heads/main/Neurons-Insert-Hyperlink/neurons-insert-hyperlink.user.js)
 
-https://raw.githubusercontent.com/Sunwall-CASL/tamper-scripts/refs/heads/main/Neurons-Insert-Hyperlink/neurons-insert-hyperlink.js
 ## Using it
 * Navigate to Neurons
 * Press **Cmd+K (Mac)** or **Ctrl+K (Windows)** inside an editable field
