@@ -15,8 +15,8 @@ Pressing **Cmd+K (Mac)** or **Ctrl+K (Windows)** inside an editable field will o
 * Press **Cmd+K (Mac)** or **Ctrl+K (Windows)** inside an editable field
 * Paste a URL into the pop-up menu and press enter/return 
 * One of the following two methods will apply:
-1. * **If you have text selected:** The selected text will be used as the link's display text and wrapped in a new hyperlink with the URL you provide.
-2.  **If you have not selected text:** The raw URL will be entered and hyperlinked at your cursor position.
+1. **If you have text selected:** The selected text will be used as the link's display text and wrapped in a new hyperlink with the URL you provide.
+2. **If you have not selected text:** The raw URL will be entered and hyperlinked at your cursor position.
 
 ## Updating / removing
 
