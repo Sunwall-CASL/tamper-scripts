@@ -10,10 +10,6 @@ This userscript adds a custom keyboard shortcut to the rich-text editors on the 
 
 Pressing **Cmd+K (Mac)** or **Ctrl+K (Windows)** inside an editable field will open a dialog to quickly insert a hyperlink.
 
-The script supports two modes:
-
-1.  
-
 ## Using it
 * Navigate to Neurons
 * Press **Cmd+K (Mac)** or **Ctrl+K (Windows)** inside an editable field
