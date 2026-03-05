@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Neurons - Reply Assistant (Detection)
 // @namespace    https://uwm-amc.ivanticloud.com/
-// @version      1.4.1
+// @version      1.41
 // @description  Detects email compose/reply dialog and logs the email thread to the console.
 // @match        https://uwm-amc.ivanticloud.com/*
 // @grant        none
