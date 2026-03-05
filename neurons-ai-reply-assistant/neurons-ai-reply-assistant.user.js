@@ -15,8 +15,7 @@
   var seenDialogs  = {};
   // ── FRAME HELPERS ────────────────────────────────────────────────────────────
   // Returns the managed iframe with the largest offsetWidth — always the active
-  // Object Workspace. Multiple x-managed-iframes exist (Dashboard, etc.);
-  // the widest one is always the incident workspace.
+  // Object Workspace. Called fresh each time to avoid stale document references.
   function getAppFrame() {
     var frames = document.querySelectorAll('iframe.x-managed-iframe');
     var best = null;
@@ -64,10 +63,8 @@
   // ── DIALOG HANDLER ───────────────────────────────────────────────────────────
   function handleDialog(dialogEl, innerDoc) {
     if (seenDialogs[dialogEl.id]) return;
-    // Confirm compose mode: find the first iframe inside the dialog and check
-    // that its body has content. Neurons uses contentEditable (not designMode)
-    // so we cannot rely on designMode === 'on'. Instead we confirm an iframe
-    // exists and its body is accessible, which is true only for compose dialogs.
+    // Confirm compose mode: find the first iframe inside the dialog and verify
+    // its body is accessible. Neurons uses contentEditable, not designMode.
     var editorIframe = dialogEl.querySelectorAll('iframe')[0];
     var isCompose = false;
     if (editorIframe) {
@@ -81,9 +78,13 @@
     readEmailThread(innerDoc);
   }
   // ── POLL FALLBACK ────────────────────────────────────────────────────────────
-  function startPoller(innerDoc) {
+  // Calls getInnerDoc() fresh every 500ms to avoid stale document references.
+  // This is the key fix in v1.5 — prior versions captured innerDoc at init time.
+  function startPoller() {
     if (pollInterval) clearInterval(pollInterval);
     pollInterval = setInterval(function () {
+      var innerDoc = getInnerDoc();
+      if (!innerDoc) return;
       var dialogs = innerDoc.querySelectorAll('.x-frs-modal-form');
       for (var i = 0; i < dialogs.length; i++) {
         handleDialog(dialogs[i], innerDoc);
@@ -94,6 +95,8 @@
   function startObserver(innerDoc) {
     if (observerRef) { try { observerRef.disconnect(); } catch (e) {} }
     observerRef = new MutationObserver(function (mutations) {
+      var currentDoc = getInnerDoc();
+      if (!currentDoc) return;
       for (var m = 0; m < mutations.length; m++) {
         var added = mutations[m].addedNodes;
         for (var n = 0; n < added.length; n++) {
@@ -103,9 +106,9 @@
           var steps = 0;
           while (el && el.tagName !== 'HTML' && steps < 30) {
             if (el.className && el.className.indexOf('x-frs-modal-form') !== -1) {
-              (function (found) {
-                setTimeout(function () { handleDialog(found, innerDoc); }, 250);
-              }(el));
+              (function (found, doc) {
+                setTimeout(function () { handleDialog(found, doc); }, 250);
+              }(el, currentDoc));
               break;
             }
             el = el.parentElement;
@@ -127,8 +130,8 @@
       return;
     }
     startObserver(innerDoc);
-    startPoller(innerDoc);
-    console.log(LOG, 'v1.4 initialized');
+    startPoller();
+    console.log(LOG, 'v1.5 initialized');
   }
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', function () { setTimeout(init, 1000); });
