@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Neurons - Reply Assistant (Detection)
 // @namespace    https://uwm-amc.ivanticloud.com/
-// @version      1.3
+// @version      1.4
 // @description  Detects email compose/reply dialog and logs the email thread to the console.
 // @match        https://uwm-amc.ivanticloud.com/*
 // @grant        none
@@ -14,10 +14,9 @@
   var pollInterval = null;
   var seenDialogs  = {};
   // ── FRAME HELPERS ────────────────────────────────────────────────────────────
-  // Returns the managed iframe with the largest offsetWidth — this is always the
-  // active Object Workspace frame. There are multiple x-managed-iframes on the page
-  // (Dashboard, Object Workspace x2); we want the widest one, not just the first
-  // with offsetWidth > 100, because ordering is unreliable.
+  // Returns the managed iframe with the largest offsetWidth — always the active
+  // Object Workspace. Multiple x-managed-iframes exist (Dashboard, etc.);
+  // the widest one is always the incident workspace.
   function getAppFrame() {
     var frames = document.querySelectorAll('iframe.x-managed-iframe');
     var best = null;
@@ -65,11 +64,16 @@
   // ── DIALOG HANDLER ───────────────────────────────────────────────────────────
   function handleDialog(dialogEl, innerDoc) {
     if (seenDialogs[dialogEl.id]) return;
-    // Confirm compose mode: must have an editor iframe with designMode=on
-    var editorIframe = dialogEl.querySelector('.x-html-editor-wrap iframe');
+    // Confirm compose mode: find the first iframe inside the dialog and check
+    // that its body has content. Neurons uses contentEditable (not designMode)
+    // so we cannot rely on designMode === 'on'. Instead we confirm an iframe
+    // exists and its body is accessible, which is true only for compose dialogs.
+    var editorIframe = dialogEl.querySelectorAll('iframe')[0];
     var isCompose = false;
     if (editorIframe) {
-      try { isCompose = (editorIframe.contentDocument.designMode === 'on'); } catch (e) {}
+      try {
+        isCompose = !!(editorIframe.contentDocument && editorIframe.contentDocument.body);
+      } catch (e) {}
     }
     if (!isCompose) return;
     seenDialogs[dialogEl.id] = true;
@@ -77,61 +81,5 @@
     readEmailThread(innerDoc);
   }
   // ── POLL FALLBACK ────────────────────────────────────────────────────────────
-  // Checks every 500ms for any open .x-frs-modal-form that hasn't been handled yet.
-  // This catches dialogs that the MutationObserver may have missed due to timing.
   function startPoller(innerDoc) {
-    if (pollInterval) clearInterval(pollInterval);
-    pollInterval = setInterval(function () {
-      var dialogs = innerDoc.querySelectorAll('.x-frs-modal-form');
-      for (var i = 0; i < dialogs.length; i++) {
-        handleDialog(dialogs[i], innerDoc);
-      }
-    }, 500);
-  }
-  // ── MUTATION OBSERVER ────────────────────────────────────────────────────────
-  function startObserver(innerDoc) {
-    if (observerRef) { try { observerRef.disconnect(); } catch (e) {} }
-    observerRef = new MutationObserver(function (mutations) {
-      for (var m = 0; m < mutations.length; m++) {
-        var added = mutations[m].addedNodes;
-        for (var n = 0; n < added.length; n++) {
-          var node = added[n];
-          if (node.nodeType !== 1) continue;
-          // Walk up from the added node to find a .x-frs-modal-form ancestor.
-          var el = node;
-          var steps = 0;
-          while (el && el.tagName !== 'HTML' && steps < 30) {
-            if (el.className && el.className.indexOf('x-frs-modal-form') !== -1) {
-              (function (found) {
-                setTimeout(function () { handleDialog(found, innerDoc); }, 250);
-              }(el));
-              break;
-            }
-            el = el.parentElement;
-            steps++;
-          }
-        }
-      }
-    });
-    observerRef.observe(innerDoc.body, { childList: true, subtree: true });
-    console.log(LOG, 'Observer attached (subtree:true)');
-  }
-  // ── INIT ─────────────────────────────────────────────────────────────────────
-  var initAttempts = 0;
-  function init() {
-    initAttempts++;
-    var innerDoc = getInnerDoc();
-    if (!innerDoc || !innerDoc.body) {
-      if (initAttempts < 30) setTimeout(init, 500);
-      return;
-    }
-    startObserver(innerDoc);
-    startPoller(innerDoc);
-    console.log(LOG, 'v1.3 initialized');
-  }
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', function () { setTimeout(init, 1000); });
-  } else {
-    setTimeout(init, 1000);
-  }
-})();
+    if (pollInterval) clearInterval(pollInterv
