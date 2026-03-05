@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Neurons - Reply Assistant (Detection)
 // @namespace    https://uwm-amc.ivanticloud.com/
-// @version      1.2
+// @version      1.3
 // @description  Detects email compose/reply dialog and logs the email thread to the console.
 // @match        https://uwm-amc.ivanticloud.com/*
 // @grant        none
@@ -13,15 +13,24 @@
   var observerRef  = null;
   var pollInterval = null;
   var seenDialogs  = {};
-  // ── FRAME HELPERS (copied exactly from reference script) ─────────────────────
+  // ── FRAME HELPERS ────────────────────────────────────────────────────────────
+  // Returns the managed iframe with the largest offsetWidth — this is always the
+  // active Object Workspace frame. There are multiple x-managed-iframes on the page
+  // (Dashboard, Object Workspace x2); we want the widest one, not just the first
+  // with offsetWidth > 100, because ordering is unreliable.
   function getAppFrame() {
     var frames = document.querySelectorAll('iframe.x-managed-iframe');
+    var best = null;
+    var bestWidth = 0;
     for (var i = 0; i < frames.length; i++) {
       try {
-        if (frames[i].contentDocument && frames[i].offsetWidth > 100) return frames[i];
+        if (frames[i].contentDocument && frames[i].offsetWidth > bestWidth) {
+          best = frames[i];
+          bestWidth = frames[i].offsetWidth;
+        }
       } catch (e) {}
     }
-    return null;
+    return best;
   }
   function getInnerDoc() {
     var f = getAppFrame();
@@ -44,11 +53,11 @@
       var body     = item.querySelector('.flex-list-item-commentText');
       var stamp    = item.querySelector('.flex-list-item-stamp');
       console.log(LOG,
-        'Message ' + (i + 1) + ':\\n' +
-        '  ' + to + '\\n' +
-        '  ' + from + '\\n' +
-        '  Subject : ' + (subject ? subject.textContent.trim() : '') + '\\n' +
-        '  Date    : ' + (stamp   ? stamp.textContent.trim()   : '') + '\\n' +
+        'Message ' + (i + 1) + ':\n' +
+        '  ' + to + '\n' +
+        '  ' + from + '\n' +
+        '  Subject : ' + (subject ? subject.textContent.trim() : '') + '\n' +
+        '  Date    : ' + (stamp   ? stamp.textContent.trim()   : '') + '\n' +
         '  Body    : ' + (body    ? body.textContent.trim()    : '')
       );
     }
@@ -89,13 +98,10 @@
           var node = added[n];
           if (node.nodeType !== 1) continue;
           // Walk up from the added node to find a .x-frs-modal-form ancestor.
-          // The dialog's outer div fires as a direct addedNode on body,
-          // but internal elements (form rows, icons) also fire and lead up to it.
           var el = node;
           var steps = 0;
           while (el && el.tagName !== 'HTML' && steps < 30) {
             if (el.className && el.className.indexOf('x-frs-modal-form') !== -1) {
-              // Use a short delay so the iframe inside has time to set designMode.
               (function (found) {
                 setTimeout(function () { handleDialog(found, innerDoc); }, 250);
               }(el));
@@ -121,7 +127,7 @@
     }
     startObserver(innerDoc);
     startPoller(innerDoc);
-    console.log(LOG, 'v1.2 initialized');
+    console.log(LOG, 'v1.3 initialized');
   }
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', function () { setTimeout(init, 1000); });
