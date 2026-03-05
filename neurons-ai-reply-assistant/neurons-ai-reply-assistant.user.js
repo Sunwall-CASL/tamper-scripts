@@ -82,4 +82,57 @@
   }
   // ── POLL FALLBACK ────────────────────────────────────────────────────────────
   function startPoller(innerDoc) {
-    if (pollInterval) clearInterval(pollInterv
+    if (pollInterval) clearInterval(pollInterval);
+    pollInterval = setInterval(function () {
+      var dialogs = innerDoc.querySelectorAll('.x-frs-modal-form');
+      for (var i = 0; i < dialogs.length; i++) {
+        handleDialog(dialogs[i], innerDoc);
+      }
+    }, 500);
+  }
+  // ── MUTATION OBSERVER ────────────────────────────────────────────────────────
+  function startObserver(innerDoc) {
+    if (observerRef) { try { observerRef.disconnect(); } catch (e) {} }
+    observerRef = new MutationObserver(function (mutations) {
+      for (var m = 0; m < mutations.length; m++) {
+        var added = mutations[m].addedNodes;
+        for (var n = 0; n < added.length; n++) {
+          var node = added[n];
+          if (node.nodeType !== 1) continue;
+          var el = node;
+          var steps = 0;
+          while (el && el.tagName !== 'HTML' && steps < 30) {
+            if (el.className && el.className.indexOf('x-frs-modal-form') !== -1) {
+              (function (found) {
+                setTimeout(function () { handleDialog(found, innerDoc); }, 250);
+              }(el));
+              break;
+            }
+            el = el.parentElement;
+            steps++;
+          }
+        }
+      }
+    });
+    observerRef.observe(innerDoc.body, { childList: true, subtree: true });
+    console.log(LOG, 'Observer attached (subtree:true)');
+  }
+  // ── INIT ─────────────────────────────────────────────────────────────────────
+  var initAttempts = 0;
+  function init() {
+    initAttempts++;
+    var innerDoc = getInnerDoc();
+    if (!innerDoc || !innerDoc.body) {
+      if (initAttempts < 30) setTimeout(init, 500);
+      return;
+    }
+    startObserver(innerDoc);
+    startPoller(innerDoc);
+    console.log(LOG, 'v1.4 initialized');
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', function () { setTimeout(init, 1000); });
+  } else {
+    setTimeout(init, 1000);
+  }
+})();
