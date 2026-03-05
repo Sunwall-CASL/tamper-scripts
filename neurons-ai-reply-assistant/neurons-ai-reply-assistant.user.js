@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Neurons - Reply Assistant (Detection)
 // @namespace    https://uwm-amc.ivanticloud.com/
-// @version      1.1
+// @version      1.2
 // @description  Detects email compose/reply dialog and logs the email thread to the console.
 // @match        https://uwm-amc.ivanticloud.com/*
 // @grant        none
@@ -10,9 +10,10 @@
 (function () {
   'use strict';
   var LOG = '[UWM Reply Assistant]';
-  var observerRef = null;
-  var seenDialogs = {};
-  // ── COPIED EXACTLY FROM REFERENCE SCRIPT ────────────────────────────────────
+  var observerRef  = null;
+  var pollInterval = null;
+  var seenDialogs  = {};
+  // ── FRAME HELPERS (copied exactly from reference script) ─────────────────────
   function getAppFrame() {
     var frames = document.querySelectorAll('iframe.x-managed-iframe');
     for (var i = 0; i < frames.length; i++) {
@@ -42,8 +43,7 @@
       var subject  = item.querySelector('.flex-list-item-subject');
       var body     = item.querySelector('.flex-list-item-commentText');
       var stamp    = item.querySelector('.flex-list-item-stamp');
-      console.log(
-        LOG,
+      console.log(LOG,
         'Message ' + (i + 1) + ':\\n' +
         '  ' + to + '\\n' +
         '  ' + from + '\\n' +
@@ -53,68 +53,64 @@
       );
     }
   }
-  // ── DIALOG DETECTION ─────────────────────────────────────────────────────────
-  function findModalAncestor(node) {
-    // Walk up from node until we find .x-frs-modal-form or reach the top.
-    // IMPORTANT: do NOT compare against a stored innerDoc reference — it may
-    // become stale. Walk until tagName is HTML or parentElement is null.
-    var el = node;
-    var steps = 0;
-    while (el && el.tagName !== 'HTML' && steps < 30) {
-      if (el.className && el.className.indexOf('x-frs-modal-form') !== -1) {
-        return el;
-      }
-      el = el.parentElement;
-      steps++;
-    }
-    return null;
-  }
-  function handleDialogDetected(dialogEl, innerDoc) {
-    // Confirm it has a live compose editor (designMode=on) so we don't
-    // fire on read-only views that also carry x-frs-modal-form.
+  // ── DIALOG HANDLER ───────────────────────────────────────────────────────────
+  function handleDialog(dialogEl, innerDoc) {
+    if (seenDialogs[dialogEl.id]) return;
+    // Confirm compose mode: must have an editor iframe with designMode=on
     var editorIframe = dialogEl.querySelector('.x-html-editor-wrap iframe');
     var isCompose = false;
     if (editorIframe) {
-      try {
-        isCompose = (editorIframe.contentDocument.designMode === 'on');
-      } catch (e) {}
+      try { isCompose = (editorIframe.contentDocument.designMode === 'on'); } catch (e) {}
     }
     if (!isCompose) return;
+    seenDialogs[dialogEl.id] = true;
     console.log(LOG, 'Compose dialog detected (id=' + dialogEl.id + ')');
     readEmailThread(innerDoc);
   }
+  // ── POLL FALLBACK ────────────────────────────────────────────────────────────
+  // Checks every 500ms for any open .x-frs-modal-form that hasn't been handled yet.
+  // This catches dialogs that the MutationObserver may have missed due to timing.
+  function startPoller(innerDoc) {
+    if (pollInterval) clearInterval(pollInterval);
+    pollInterval = setInterval(function () {
+      var dialogs = innerDoc.querySelectorAll('.x-frs-modal-form');
+      for (var i = 0; i < dialogs.length; i++) {
+        handleDialog(dialogs[i], innerDoc);
+      }
+    }, 500);
+  }
   // ── MUTATION OBSERVER ────────────────────────────────────────────────────────
   function startObserver(innerDoc) {
-    if (observerRef) {
-      try { observerRef.disconnect(); } catch (e) {}
-    }
-    // BUG FIX: Use subtree:true.
-    // ExtJS adds the dialog's outer <div> via a non-standard method that bypasses
-    // childList mutations on body. However, it builds the dialog's internal content
-    // (form rows, required-icon spans, etc.) using standard DOM calls which DO fire
-    // subtree mutations. We walk up from each added node to find the modal ancestor.
+    if (observerRef) { try { observerRef.disconnect(); } catch (e) {} }
     observerRef = new MutationObserver(function (mutations) {
       for (var m = 0; m < mutations.length; m++) {
         var added = mutations[m].addedNodes;
         for (var n = 0; n < added.length; n++) {
           var node = added[n];
           if (node.nodeType !== 1) continue;
-          var dialogEl = findModalAncestor(node);
-          if (!dialogEl) continue;
-          // Debounce: each dialog fires several mutations; only handle it once.
-          if (seenDialogs[dialogEl.id]) continue;
-          seenDialogs[dialogEl.id] = true;
-          // Use a short delay so the dialog is fully built before we inspect it.
-          (function (el) {
-            setTimeout(function () { handleDialogDetected(el, innerDoc); }, 200);
-          }(dialogEl));
+          // Walk up from the added node to find a .x-frs-modal-form ancestor.
+          // The dialog's outer div fires as a direct addedNode on body,
+          // but internal elements (form rows, icons) also fire and lead up to it.
+          var el = node;
+          var steps = 0;
+          while (el && el.tagName !== 'HTML' && steps < 30) {
+            if (el.className && el.className.indexOf('x-frs-modal-form') !== -1) {
+              // Use a short delay so the iframe inside has time to set designMode.
+              (function (found) {
+                setTimeout(function () { handleDialog(found, innerDoc); }, 250);
+              }(el));
+              break;
+            }
+            el = el.parentElement;
+            steps++;
+          }
         }
       }
     });
     observerRef.observe(innerDoc.body, { childList: true, subtree: true });
-    console.log(LOG, 'Observer attached to innerDoc.body (subtree:true)');
+    console.log(LOG, 'Observer attached (subtree:true)');
   }
-  // ── INIT (same retry pattern as reference script) ────────────────────────────
+  // ── INIT ─────────────────────────────────────────────────────────────────────
   var initAttempts = 0;
   function init() {
     initAttempts++;
@@ -124,7 +120,8 @@
       return;
     }
     startObserver(innerDoc);
-    console.log(LOG, 'v1.1 initialized');
+    startPoller(innerDoc);
+    console.log(LOG, 'v1.2 initialized');
   }
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', function () { setTimeout(init, 1000); });
