@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Neurons - Reply Assistant
 // @namespace    https://uwm-amc.ivanticloud.com/
-// @version      1.12
+// @version      1.11
 // @description  Detects reply/compose dialog via RTF toolbar, injects triggers on Reply click only.
 // @match        https://uwm-amc.ivanticloud.com/*
 // @grant        none
@@ -45,8 +45,7 @@
   var popupActive  = false;
   var isMinimized  = false;
   var escListener  = null;
-  // replyWatching removed in v1.12 — RTF toolbar signal is reliable enough
-  // to scan always; click interception failed against ExtJS event handling.
+  var replyWatching = false; // true after a Reply click, while we wait for compose dialog
 
   // ── FRAME HELPERS ────────────────────────────────────────────────────────────
   function getAppFrame() {
@@ -158,6 +157,36 @@
 
     console.log(LOG, 'isComposeDialog: No RTF toolbar found — treating as viewer dialog');
     return false;
+  }
+
+  // ── WATCH FOR REPLY BUTTON CLICKS ─────────────────────────────────────────────
+  // Attaches click listeners to Reply/Reply All/Forward buttons in the inner iframe.
+  // When one is clicked, sets replyWatching = true so that the next compose dialog
+  // detected by the poller/observer will have triggers injected.
+  // This ensures the "AI Assistant" button ONLY appears after a Reply-type action.
+  var replyListenersAttached = false;
+  function attachReplyListeners(innerDoc) {
+    if (replyListenersAttached) return;
+
+    // Use event delegation on the inner iframe body — catches Reply buttons
+    // regardless of their dynamic IDs or ExtJS component structure.
+    innerDoc.body.addEventListener('click', function (e) {
+      var el = e.target;
+      // Walk up a few levels to find the button element
+      for (var s = 0; s < 5; s++) {
+        if (!el || el === innerDoc.body) break;
+        var txt = (el.textContent || '').trim();
+        if (txt === 'Reply' || txt === 'Reply All' || txt === 'Forward') {
+          console.log(LOG, 'Reply/Forward click detected ("' + txt + '") — watching for compose dialog');
+          replyWatching = true;
+          return;
+        }
+        el = el.parentElement;
+      }
+    }, true); // capture phase so we see it before ExtJS
+
+    replyListenersAttached = true;
+    console.log(LOG, 'Reply button listeners attached');
   }
 
   // ── TOOLBAR COMMAND HELPER ────────────────────────────────────────────────────
@@ -538,7 +567,7 @@
           '<span id="uwm-ra-searching"><span class="ra-spinner"></span>Searching knowledge base\u2026</span>',
           '<div class="ra-header-actions">',
             '<button id="uwm-ra-minimize-btn" title="Minimize \u2014 draft preserved">\u2013</button>',
-            '<span class="ra-version">v1.12</span>',
+            '<span class="ra-version">v1.11</span>',
           '</div>',
         '</div>',
 
@@ -709,15 +738,19 @@
   }
 
   // ── HANDLE COMPOSE DIALOG ─────────────────────────────────────────────────────
-  // Called whenever a .x-frs-modal-form is found in the inner iframe.
-  // Uses RTF toolbar detection to confirm it is a compose dialog.
-  // No click-gate — we scan always and let isComposeDialog() do the filtering.
-  // The viewer dialog will never pass isComposeDialog() because it has no
-  // bold/italic/formatting toolbar inside it.
+  // Only called when replyWatching is true (i.e. after a Reply/Forward click).
+  // Confirms the dialog is a compose dialog via RTF toolbar detection, then
+  // injects triggers and starts the cleanup poller.
   function handleDialog(dialogEl, innerDoc) {
     if (seenDialogs[dialogEl.id]) return;
+
+    // Only proceed if the user clicked Reply/Reply All/Forward first
+    if (!replyWatching) return;
+
     if (!isComposeDialog(dialogEl)) return;
 
+    // Confirmed compose dialog — consume the replyWatching flag
+    replyWatching = false;
     seenDialogs[dialogEl.id] = true;
     console.log(LOG, 'Compose dialog confirmed (id=' + dialogEl.id + ') — injecting triggers');
 
@@ -727,6 +760,7 @@
       showPopup(dialogEl, thread);
     }
 
+    // Inject button into compose dialog's RTF toolbar (not the viewer toolbar)
     injectToolbarButton(dialogEl, innerDoc, openAssistant);
     injectBadge(openAssistant);
 
@@ -747,13 +781,18 @@
   }
 
   // ── POLL FALLBACK ────────────────────────────────────────────────────────────
-  // Scans for .x-frs-modal-form dialogs every 500ms. isComposeDialog() gates
-  // on RTF toolbar presence — the viewer will never pass that check.
   function startPoller() {
     if (pollInterval) clearInterval(pollInterval);
     pollInterval = setInterval(function () {
       var innerDoc = getInnerDoc();
       if (!innerDoc) return;
+
+      // Attach Reply button listeners once the inner doc is ready
+      attachReplyListeners(innerDoc);
+
+      // Only scan for dialogs when we're actively watching for one
+      if (!replyWatching) return;
+
       var dialogs = innerDoc.querySelectorAll('.x-frs-modal-form');
       for (var i = 0; i < dialogs.length; i++) {
         handleDialog(dialogs[i], innerDoc);
@@ -762,10 +801,10 @@
   }
 
   // ── MUTATION OBSERVER ────────────────────────────────────────────────────────
-  // Watches for new dialogs. isComposeDialog() filters viewer vs compose.
   function startObserver(innerDoc) {
     if (observerRef) { try { observerRef.disconnect(); } catch (e) {} }
     observerRef = new MutationObserver(function () {
+      if (!replyWatching) return; // ignore mutations unless we're watching for a compose dialog
       var currentDoc = getInnerDoc();
       if (!currentDoc) return;
       var dialogs = currentDoc.querySelectorAll('.x-frs-modal-form');
@@ -789,9 +828,10 @@
       if (initAttempts < 30) setTimeout(init, 500);
       return;
     }
+    attachReplyListeners(innerDoc);
     startObserver(innerDoc);
     startPoller();
-    console.log(LOG, 'v1.12 initialized');
+    console.log(LOG, 'v1.11 initialized');
   }
 
   if (document.readyState === 'loading') {
