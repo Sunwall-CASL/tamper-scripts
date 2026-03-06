@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Neurons - Reply Assistant
 // @namespace    https://uwm-amc.ivanticloud.com/
-// @version      1.14
+// @version      1.15
 // @description  Detects reply/compose dialog via RTF toolbar, injects triggers on Reply click only.
 // @match        https://uwm-amc.ivanticloud.com/*
 // @grant        none
@@ -555,7 +555,7 @@
           '<span id="uwm-ra-searching"><span class="ra-spinner"></span>Searching knowledge base\u2026</span>',
           '<div class="ra-header-actions">',
             '<button id="uwm-ra-minimize-btn" title="Minimize \u2014 draft preserved">\u2013</button>',
-            '<span class="ra-version">v1.14</span>',
+            '<span class="ra-version">v1.15</span>',
           '</div>',
         '</div>',
 
@@ -668,18 +668,28 @@
     document.getElementById('uwm-ra-minimize-btn').addEventListener('click', minimizePopup);
 
     // Insert — prepends to top, never overwrites
+    // Re-fetches the compose dialog by its ID from the current inner iframe DOM
+    // at insert time to guarantee we target the right dialog, not the viewer.
     document.getElementById('uwm-ra-insert').addEventListener('click', function () {
       var html = document.getElementById('uwm-ra-editor').innerHTML;
       if (!html || !html.trim()) {
         alert('[UWM Reply Assistant] Nothing to insert \u2014 the editor is empty.');
         return;
       }
-      var editorIframe = getEditorIframe(dialogEl);
+      // Re-fetch the compose dialog from the live DOM by its captured ID.
+      // This ensures we always target the correct dialog even when multiple
+      // .x-frs-modal-form dialogs are stacked (viewer + compose).
+      var currentInnerDoc = getInnerDoc();
+      var freshDialog = currentInnerDoc ? currentInnerDoc.getElementById(dialogEl.id) : null;
+      var targetDialog = freshDialog || dialogEl; // fallback to captured ref
+
+      var editorIframe = getEditorIframe(targetDialog);
       if (!editorIframe) {
         alert('[UWM Reply Assistant] Could not find the Neurons compose editor. The dialog may have closed.');
         closePopup();
         return;
       }
+      console.log(LOG, 'Inserting into dialog id=' + targetDialog.id + ', iframe body editable=' + (editorIframe.contentDocument && editorIframe.contentDocument.body ? editorIframe.contentDocument.body.isContentEditable : 'unknown'));
       try {
         insertDraftAtTop(editorIframe, html);
         closePopup();
@@ -834,23 +844,15 @@
   }
 
   // ── MUTATION OBSERVER ────────────────────────────────────────────────────────
-  // Watches for new dialogs appearing in the DOM. handleDialog() skips any dialog
-  // whose ID is in knownDialogIds (pre-existing viewer dialogs).
+  // REMOVED in v1.15. The MutationObserver fired at ~300ms after a dialog
+  // appeared, defeating the 2000ms stabilisation window that distinguishes the
+  // viewer dialog (pre-existing) from the reply dialog (new). The poller alone
+  // is sufficient — it detects new dialogs within 500ms, which is fast enough
+  // for the Reply workflow. Using only the poller ensures the stabilisation
+  // window is always respected before handleDialog() is called.
   function startObserver(innerDoc) {
-    if (observerRef) { try { observerRef.disconnect(); } catch (e) {} }
-    observerRef = new MutationObserver(function () {
-      var currentDoc = getInnerDoc();
-      if (!currentDoc) return;
-      if (!snapshotTaken) return; // wait for snapshot before processing mutations
-      var dialogs = currentDoc.querySelectorAll('.x-frs-modal-form');
-      for (var i = 0; i < dialogs.length; i++) {
-        (function (el, doc) {
-          setTimeout(function () { handleDialog(el, doc); }, 300);
-        }(dialogs[i], currentDoc));
-      }
-    });
-    observerRef.observe(innerDoc.body, { childList: true, subtree: true });
-    console.log(LOG, 'MutationObserver attached');
+    // Intentionally empty — detection is handled entirely by startPoller().
+    console.log(LOG, 'Observer skipped — poller-only mode (v1.15)');
   }
 
   // ── INIT ─────────────────────────────────────────────────────────────────────
@@ -865,7 +867,7 @@
     }
     startObserver(innerDoc);
     startPoller();
-    console.log(LOG, 'v1.14 initialized');
+    console.log(LOG, 'v1.15 initialized — poller-only detection, 2s stabilisation window');
   }
 
   if (document.readyState === 'loading') {
