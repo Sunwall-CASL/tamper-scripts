@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name         Neurons - Reply Assistant
 // @namespace    https://uwm-amc.ivanticloud.com/
-// @version      1.9
+// @version      1.10
 // @description  Detects reply dialog, injects trigger button + badge. Pop-up opens only on user request.
 // @match        https://uwm-amc.ivanticloud.com/*
 // @grant        none
 // @run-at       document-idle
 // ==/UserScript==
 
+// NOTE v1.10: Tightened isComposeDialog() — see function comment for details.
 // NOTE v1.9: Three fixes from v1.8:
 //
 // 1. AUTO-OPEN REMOVED. The pop-up no longer opens automatically. Instead,
@@ -104,33 +105,85 @@
   }
 
   // ── IS COMPOSE DIALOG? ────────────────────────────────────────────────────────
-  // Distinguishes the compose/reply dialog from the email viewer dialog.
-  // Strategy: a compose dialog's editor iframe body has contentEditable="true"
-  // OR the dialog contains a button whose text includes "Send" or "Save".
-  // The viewer dialog has neither.
+  // Distinguishes the reply/compose dialog from the read-only email viewer dialog.
+  //
+  // ROOT CAUSE OF v1.9 FALSE POSITIVE: Neurons sets the contentEditable *attribute*
+  // on the viewer body too — so attribute checks are unreliable. The viewer body is
+  // visually read-only but the attribute reads "true". We need behavioural signals.
+  //
+  // THREE SIGNALS — compose is confirmed if Signal 1 OR (Signal 2 AND Signal 3):
+  //
+  //   Signal 1: Dialog contains a visible recipient input field ("To:", "CC:").
+  //             Compose dialogs always have recipient fields. Viewers never do.
+  //
+  //   Signal 2: Dialog toolbar contains "Save" button text (not "Reply").
+  //             The viewer toolbar has Reply/Reply All/Forward.
+  //             The compose toolbar has Save (Neurons saves drafts, not Send).
+  //
+  //   Signal 3: Editor iframe body is empty or near-empty (< 60 chars of text).
+  //             The viewer body contains the client's full email — always has
+  //             substantial text content. The compose body starts blank or with
+  //             only a short signature stub.
+  //
+  // Using Signal 1 alone is sufficient and most reliable. Signals 2+3 are
+  // fallbacks in case Neurons renders the To: field outside the dialog element.
   function isComposeDialog(dialogEl) {
-    // Check 1: editor iframe with contentEditable body
+
+    // ── Signal 1: recipient input field present ───────────────────────────────
+    // Look for any visible text input near a "To" label, or an input with a
+    // name/placeholder/aria-label suggesting it is a recipient field.
+    var allInputs = dialogEl.querySelectorAll('input[type="text"], input:not([type])');
+    for (var i = 0; i < allInputs.length; i++) {
+      var inp = allInputs[i];
+      var name        = (inp.name        || '').toLowerCase();
+      var placeholder = (inp.placeholder || '').toLowerCase();
+      var ariaLabel   = (inp.getAttribute('aria-label') || '').toLowerCase();
+      var id          = (inp.id          || '').toLowerCase();
+      if (name === 'to' || name === 'toaddress' ||
+          placeholder.indexOf('to') === 0 ||
+          ariaLabel.indexOf('to') !== -1 ||
+          id.indexOf('to') !== -1) {
+        console.log(LOG, 'isComposeDialog: Signal 1 matched (recipient input found)');
+        return true;
+      }
+    }
+
+    // Also check for a label element with text "To" immediately preceding an input
+    var labels = dialogEl.querySelectorAll('label, .x-form-item-label, td.x-form-item-label');
+    for (var l = 0; l < labels.length; l++) {
+      var labelText = (labels[l].textContent || '').trim().toLowerCase();
+      if (labelText === 'to' || labelText === 'to:') {
+        console.log(LOG, 'isComposeDialog: Signal 1 matched (To: label found)');
+        return true;
+      }
+    }
+
+    // ── Signal 2: toolbar contains "Save" button ──────────────────────────────
+    var hasSave = false;
+    var btns = dialogEl.querySelectorAll('button, .x-btn-text, td.x-btn-mc');
+    for (var b = 0; b < btns.length; b++) {
+      var txt = (btns[b].textContent || '').trim().toLowerCase();
+      if (txt === 'save') { hasSave = true; break; }
+    }
+
+    // ── Signal 3: editor body is empty or near-empty ──────────────────────────
+    var isBodyEmpty = false;
     var editorIframe = getEditorIframe(dialogEl);
     if (editorIframe) {
       try {
-        var body = editorIframe.contentDocument.body;
-        if (body && (body.contentEditable === 'true' || body.isContentEditable)) {
-          return true;
-        }
+        var bodyText = (editorIframe.contentDocument.body.innerText || '').trim();
+        // Compose body: blank, or just a short signature (< 120 chars).
+        // Viewer body: contains the full client email (almost always > 120 chars).
+        isBodyEmpty = bodyText.length < 120;
       } catch (e) {}
     }
 
-    // Check 2: dialog contains a "Send" or "Save" button (compose-mode buttons)
-    var btns = dialogEl.querySelectorAll('button, .x-btn-text');
-    for (var i = 0; i < btns.length; i++) {
-      var txt = (btns[i].textContent || '').trim().toLowerCase();
-      if (txt === 'send' || txt === 'save') return true;
+    if (hasSave && isBodyEmpty) {
+      console.log(LOG, 'isComposeDialog: Signals 2+3 matched (Save button + empty body)');
+      return true;
     }
 
-    // Check 3: dialog contains a "To:" input field (compose mode has recipients)
-    var inputs = dialogEl.querySelectorAll('input[name="To"], input[id*="To"]');
-    if (inputs.length) return true;
-
+    console.log(LOG, 'isComposeDialog: No signals matched — treating as viewer dialog');
     return false;
   }
 
@@ -551,7 +604,7 @@
           '</span>',
           '<div class="ra-header-actions">',
             '<button id="uwm-ra-minimize-btn" title="Minimize \u2014 draft will be preserved">\u2013</button>',
-            '<span class="ra-version">v1.9</span>',
+            '<span class="ra-version">v1.10</span>',
           '</div>',
         '</div>',
 
@@ -835,7 +888,7 @@
     }
     startObserver(innerDoc);
     startPoller();
-    console.log(LOG, 'v1.9 initialized');
+    console.log(LOG, 'v1.10 initialized');
   }
 
   if (document.readyState === 'loading') {
