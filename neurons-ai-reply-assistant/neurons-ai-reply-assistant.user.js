@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Neurons - Reply Assistant
 // @namespace    https://uwm-amc.ivanticloud.com/
-// @version      1.12
+// @version      1.13
 // @description  Detects reply/compose dialog via RTF toolbar, injects triggers on Reply click only.
 // @match        https://uwm-amc.ivanticloud.com/*
 // @grant        none
@@ -42,6 +42,13 @@
   var pollInterval = null;
   var cleanPoller  = null;
   var seenDialogs  = {};
+  // knownDialogIds: snapshot of all .x-frs-modal-form IDs that existed at page
+  // load time (or when the viewer dialog first opened). Only dialogs whose IDs
+  // are NOT in this set will be treated as reply/compose dialogs. This is the
+  // definitive way to distinguish "existing viewer" from "newly created compose"
+  // because Neurons uses identical markup for both — the only reliable difference
+  // is that the compose dialog is NEW (created after Reply is clicked).
+  var knownDialogIds = {};
   var popupActive  = false;
   var isMinimized  = false;
   var escListener  = null;
@@ -538,7 +545,7 @@
           '<span id="uwm-ra-searching"><span class="ra-spinner"></span>Searching knowledge base\u2026</span>',
           '<div class="ra-header-actions">',
             '<button id="uwm-ra-minimize-btn" title="Minimize \u2014 draft preserved">\u2013</button>',
-            '<span class="ra-version">v1.12</span>',
+            '<span class="ra-version">v1.13</span>',
           '</div>',
         '</div>',
 
@@ -709,17 +716,31 @@
   }
 
   // ── HANDLE COMPOSE DIALOG ─────────────────────────────────────────────────────
-  // Called whenever a .x-frs-modal-form is found in the inner iframe.
-  // Uses RTF toolbar detection to confirm it is a compose dialog.
-  // No click-gate — we scan always and let isComposeDialog() do the filtering.
-  // The viewer dialog will never pass isComposeDialog() because it has no
-  // bold/italic/formatting toolbar inside it.
+  // THE KEY INSIGHT from diagnostic: both the viewer and reply dialogs have
+  // identical markup — same classes, same buttons, same html-editor. The ONLY
+  // reliable difference is that the compose dialog is NEW: it was not present
+  // when the page loaded or when we took our last snapshot.
+  //
+  // Strategy:
+  //   1. At init, snapshot all existing .x-frs-modal-form IDs → knownDialogIds
+  //   2. When a dialog is found, skip it if its ID is in knownDialogIds
+  //   3. New dialogs (IDs not in knownDialogIds) are reply/compose dialogs
+  //   4. Still require isComposeDialog() as a secondary guard (RTF toolbar)
+  //      to avoid acting on other new modals Neurons might open
   function handleDialog(dialogEl, innerDoc) {
     if (seenDialogs[dialogEl.id]) return;
-    if (!isComposeDialog(dialogEl)) return;
+
+    // Skip any dialog that existed before we started watching
+    if (knownDialogIds[dialogEl.id]) return;
+
+    // Secondary guard: must have an RTF editor toolbar
+    if (!isComposeDialog(dialogEl)) {
+      console.log(LOG, 'New dialog ' + dialogEl.id + ' skipped — no RTF toolbar');
+      return;
+    }
 
     seenDialogs[dialogEl.id] = true;
-    console.log(LOG, 'Compose dialog confirmed (id=' + dialogEl.id + ') — injecting triggers');
+    console.log(LOG, 'NEW compose dialog confirmed (id=' + dialogEl.id + ') — injecting triggers');
 
     var thread = readEmailThread(innerDoc);
 
@@ -747,14 +768,26 @@
   }
 
   // ── POLL FALLBACK ────────────────────────────────────────────────────────────
-  // Scans for .x-frs-modal-form dialogs every 500ms. isComposeDialog() gates
-  // on RTF toolbar presence — the viewer will never pass that check.
+  // On the first poll, snapshots all existing dialog IDs into knownDialogIds.
+  // Subsequent polls only call handleDialog() for NEW dialogs not in that set.
+  var snapshotTaken = false;
   function startPoller() {
     if (pollInterval) clearInterval(pollInterval);
     pollInterval = setInterval(function () {
       var innerDoc = getInnerDoc();
       if (!innerDoc) return;
       var dialogs = innerDoc.querySelectorAll('.x-frs-modal-form');
+
+      // Take snapshot of pre-existing dialogs on first run
+      if (!snapshotTaken) {
+        for (var s = 0; s < dialogs.length; s++) {
+          knownDialogIds[dialogs[s].id] = true;
+        }
+        snapshotTaken = true;
+        console.log(LOG, 'Snapshot taken — ' + dialogs.length + ' pre-existing dialog(s) ignored');
+        return;
+      }
+
       for (var i = 0; i < dialogs.length; i++) {
         handleDialog(dialogs[i], innerDoc);
       }
@@ -762,12 +795,14 @@
   }
 
   // ── MUTATION OBSERVER ────────────────────────────────────────────────────────
-  // Watches for new dialogs. isComposeDialog() filters viewer vs compose.
+  // Watches for new dialogs appearing in the DOM. handleDialog() skips any dialog
+  // whose ID is in knownDialogIds (pre-existing viewer dialogs).
   function startObserver(innerDoc) {
     if (observerRef) { try { observerRef.disconnect(); } catch (e) {} }
     observerRef = new MutationObserver(function () {
       var currentDoc = getInnerDoc();
       if (!currentDoc) return;
+      if (!snapshotTaken) return; // wait for snapshot before processing mutations
       var dialogs = currentDoc.querySelectorAll('.x-frs-modal-form');
       for (var i = 0; i < dialogs.length; i++) {
         (function (el, doc) {
@@ -791,7 +826,7 @@
     }
     startObserver(innerDoc);
     startPoller();
-    console.log(LOG, 'v1.12 initialized');
+    console.log(LOG, 'v1.13 initialized');
   }
 
   if (document.readyState === 'loading') {
