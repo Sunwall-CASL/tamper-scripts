@@ -1,35 +1,38 @@
 // ==UserScript==
 // @name         Neurons - Reply Assistant
 // @namespace    https://uwm-amc.ivanticloud.com/
-// @version      1.10
-// @description  Detects reply dialog, injects trigger button + badge. Pop-up opens only on user request.
+// @version      1.11
+// @description  Detects reply/compose dialog via RTF toolbar, injects triggers on Reply click only.
 // @match        https://uwm-amc.ivanticloud.com/*
 // @grant        none
 // @run-at       document-idle
 // ==/UserScript==
 
-// NOTE v1.10: Tightened isComposeDialog() — see function comment for details.
-// NOTE v1.9: Three fixes from v1.8:
+// ── CHANGES IN v1.11 ─────────────────────────────────────────────────────────
 //
-// 1. AUTO-OPEN REMOVED. The pop-up no longer opens automatically. Instead,
-//    when a compose dialog is detected, two triggers are injected:
-//    (a) A button in the Neurons reply toolbar ("✦ AI Assistant")
-//    (b) A subtle floating badge in the bottom-right corner of the compose dialog
-//    The user clicks either one to open the assistant when they want it.
+// 1. DETECTION REWRITE — isComposeDialog() now uses a single definitive signal:
+//    the presence of a rich text formatting toolbar (Bold/Italic/Underline buttons)
+//    INSIDE the compose dialog itself. The email viewer dialog has Reply/Reply All/
+//    Forward buttons but NO bold/italic/underline formatting controls. The compose
+//    dialog has a full RTF toolbar. This is the most reliable distinguisher available
+//    and cannot produce false positives on the viewer dialog.
 //
-// 2. RE-FIRE BUG FIXED. Previously, closePopup() reset seenDialogs = {} which
-//    caused the poller to immediately re-detect the still-open compose dialog
-//    and relaunch the pop-up. Fix: seenDialogs is only cleared when the compose
-//    dialog is actually gone from the DOM (detected by a separate cleanup poller).
-//    The dialog ID remains in seenDialogs until Neurons closes the dialog.
+// 2. TRIGGERS FIRE ON REPLY CLICK — instead of watching for new dialogs generically,
+//    the script now intercepts clicks on Reply/Reply All/Forward buttons in the inner
+//    iframe. Only after one of those buttons is clicked does the script watch for the
+//    resulting compose dialog and inject the trigger button + badge. This means:
+//    - Opening an email to read it: no triggers, no badge, nothing
+//    - Clicking Reply: compose dialog opens, triggers appear
 //
-// 3. TRIGGER FIRES ON EMAIL OPEN (not just Reply) — FIXED. The old approach
-//    detected any .x-frs-modal-form with an iframe, which includes the email
-//    viewer. The new approach watches specifically for the compose dialog by
-//    checking whether the dialog contains a contentEditable body iframe AND
-//    whether a Reply/Reply All button is visible in the inner iframe toolbar
-//    at the time of detection. The trigger buttons are only injected once per
-//    dialog instance, tracked by dialog ID.
+// 3. INSERT PREPENDS, NOT OVERWRITES — the draft is inserted at the very top of
+//    the Neurons editor body (before existing content: signature, email thread).
+//    The existing content is preserved below the inserted draft. innerHTML is
+//    never replaced — nodes are prepended instead.
+//
+// 4. TOOLBAR BUTTON INJECTED INTO COMPOSE DIALOG, NOT VIEWER TOOLBAR — the
+//    "AI Assistant" button is now injected into the compose dialog's own RTF
+//    toolbar row, not the viewer's Reply/Forward toolbar. This means it stays
+//    visible when the compose dialog is open, and disappears when it closes.
 
 (function () {
   'use strict';
@@ -37,11 +40,12 @@
   var LOG          = '[UWM Reply Assistant]';
   var observerRef  = null;
   var pollInterval = null;
-  var cleanPoller  = null;   // Watches for the compose dialog to close
-  var seenDialogs  = {};     // dialogId → true once triggers injected
+  var cleanPoller  = null;
+  var seenDialogs  = {};
   var popupActive  = false;
   var isMinimized  = false;
-  var escListener  = null;   // Stored so it can be removed on close
+  var escListener  = null;
+  var replyWatching = false; // true after a Reply click, while we wait for compose dialog
 
   // ── FRAME HELPERS ────────────────────────────────────────────────────────────
   function getAppFrame() {
@@ -90,9 +94,6 @@
   }
 
   // ── FIND COMPOSE EDITOR IFRAME ────────────────────────────────────────────────
-  // The compose dialog contains a contentEditable iframe — the Neurons rich text
-  // editor. This is what distinguishes a compose dialog from the read-only email
-  // viewer dialog (which has a non-editable iframe body).
   function getEditorIframe(dialogEl) {
     var iframes = dialogEl.querySelectorAll('iframe');
     for (var i = 0; i < iframes.length; i++) {
@@ -105,86 +106,87 @@
   }
 
   // ── IS COMPOSE DIALOG? ────────────────────────────────────────────────────────
-  // Distinguishes the reply/compose dialog from the read-only email viewer dialog.
+  // Single definitive signal: the compose dialog contains a rich text formatting
+  // toolbar with Bold/Italic/Underline buttons INSIDE the dialog element.
   //
-  // ROOT CAUSE OF v1.9 FALSE POSITIVE: Neurons sets the contentEditable *attribute*
-  // on the viewer body too — so attribute checks are unreliable. The viewer body is
-  // visually read-only but the attribute reads "true". We need behavioural signals.
+  // The email viewer dialog has a toolbar with Reply/Reply All/Forward buttons,
+  // but NO bold/italic/underline formatting controls — those only appear when
+  // Neurons opens a compose/reply window with an editable message body.
   //
-  // THREE SIGNALS — compose is confirmed if Signal 1 OR (Signal 2 AND Signal 3):
+  // We look for button elements or toolbar cells whose text or title attributes
+  // match common RTF formatting labels. Neurons uses ExtJS toolbar buttons which
+  // render as <button> or <td class="x-btn-mc"> elements with text content.
   //
-  //   Signal 1: Dialog contains a visible recipient input field ("To:", "CC:").
-  //             Compose dialogs always have recipient fields. Viewers never do.
-  //
-  //   Signal 2: Dialog toolbar contains "Save" button text (not "Reply").
-  //             The viewer toolbar has Reply/Reply All/Forward.
-  //             The compose toolbar has Save (Neurons saves drafts, not Send).
-  //
-  //   Signal 3: Editor iframe body is empty or near-empty (< 60 chars of text).
-  //             The viewer body contains the client's full email — always has
-  //             substantial text content. The compose body starts blank or with
-  //             only a short signature stub.
-  //
-  // Using Signal 1 alone is sufficient and most reliable. Signals 2+3 are
-  // fallbacks in case Neurons renders the To: field outside the dialog element.
+  // We specifically look for the FORMATTING toolbar being INSIDE the dialog, not
+  // just anywhere on the page — this prevents false positives from other toolbars.
   function isComposeDialog(dialogEl) {
+    var allBtns = dialogEl.querySelectorAll(
+      'button, .x-btn-text, td.x-btn-mc, .x-tool-type-bold, .x-tool-type-italic'
+    );
 
-    // ── Signal 1: recipient input field present ───────────────────────────────
-    // Look for any visible text input near a "To" label, or an input with a
-    // name/placeholder/aria-label suggesting it is a recipient field.
-    var allInputs = dialogEl.querySelectorAll('input[type="text"], input:not([type])');
-    for (var i = 0; i < allInputs.length; i++) {
-      var inp = allInputs[i];
-      var name        = (inp.name        || '').toLowerCase();
-      var placeholder = (inp.placeholder || '').toLowerCase();
-      var ariaLabel   = (inp.getAttribute('aria-label') || '').toLowerCase();
-      var id          = (inp.id          || '').toLowerCase();
-      if (name === 'to' || name === 'toaddress' ||
-          placeholder.indexOf('to') === 0 ||
-          ariaLabel.indexOf('to') !== -1 ||
-          id.indexOf('to') !== -1) {
-        console.log(LOG, 'isComposeDialog: Signal 1 matched (recipient input found)');
+    for (var i = 0; i < allBtns.length; i++) {
+      var el    = allBtns[i];
+      var text  = (el.textContent  || '').trim().toLowerCase();
+      var title = (el.title        || '').trim().toLowerCase();
+      var cls   = (el.className    || '').toLowerCase();
+
+      // Bold/Italic/Underline formatting buttons — only present in compose mode
+      if (text === 'bold'   || title === 'bold'   || cls.indexOf('bold')   !== -1 ||
+          text === 'italic' || title === 'italic' || cls.indexOf('italic') !== -1) {
+        console.log(LOG, 'isComposeDialog: RTF toolbar signal matched (bold/italic button found in dialog)');
         return true;
       }
     }
 
-    // Also check for a label element with text "To" immediately preceding an input
-    var labels = dialogEl.querySelectorAll('label, .x-form-item-label, td.x-form-item-label');
-    for (var l = 0; l < labels.length; l++) {
-      var labelText = (labels[l].textContent || '').trim().toLowerCase();
-      if (labelText === 'to' || labelText === 'to:') {
-        console.log(LOG, 'isComposeDialog: Signal 1 matched (To: label found)');
+    // Also check for ExtJS toolbar items rendered as images with alt text
+    var imgs = dialogEl.querySelectorAll('img[alt], img[title]');
+    for (var j = 0; j < imgs.length; j++) {
+      var alt = ((imgs[j].alt || imgs[j].title) || '').toLowerCase();
+      if (alt === 'bold' || alt === 'italic' || alt === 'underline') {
+        console.log(LOG, 'isComposeDialog: RTF toolbar signal matched (bold/italic img found)');
         return true;
       }
     }
 
-    // ── Signal 2: toolbar contains "Save" button ──────────────────────────────
-    var hasSave = false;
-    var btns = dialogEl.querySelectorAll('button, .x-btn-text, td.x-btn-mc');
-    for (var b = 0; b < btns.length; b++) {
-      var txt = (btns[b].textContent || '').trim().toLowerCase();
-      if (txt === 'save') { hasSave = true; break; }
-    }
-
-    // ── Signal 3: editor body is empty or near-empty ──────────────────────────
-    var isBodyEmpty = false;
-    var editorIframe = getEditorIframe(dialogEl);
-    if (editorIframe) {
-      try {
-        var bodyText = (editorIframe.contentDocument.body.innerText || '').trim();
-        // Compose body: blank, or just a short signature (< 120 chars).
-        // Viewer body: contains the full client email (almost always > 120 chars).
-        isBodyEmpty = bodyText.length < 120;
-      } catch (e) {}
-    }
-
-    if (hasSave && isBodyEmpty) {
-      console.log(LOG, 'isComposeDialog: Signals 2+3 matched (Save button + empty body)');
+    // Final check: look for the Neurons HTML editor toolbar class patterns
+    // ExtJS HTML editor renders a toolbar with class containing 'x-html-editor-tb'
+    if (dialogEl.querySelector('.x-html-editor-tb, .x-html-editor-wrap, [class*="html-editor"]')) {
+      console.log(LOG, 'isComposeDialog: RTF toolbar signal matched (html-editor class found)');
       return true;
     }
 
-    console.log(LOG, 'isComposeDialog: No signals matched — treating as viewer dialog');
+    console.log(LOG, 'isComposeDialog: No RTF toolbar found — treating as viewer dialog');
     return false;
+  }
+
+  // ── WATCH FOR REPLY BUTTON CLICKS ─────────────────────────────────────────────
+  // Attaches click listeners to Reply/Reply All/Forward buttons in the inner iframe.
+  // When one is clicked, sets replyWatching = true so that the next compose dialog
+  // detected by the poller/observer will have triggers injected.
+  // This ensures the "AI Assistant" button ONLY appears after a Reply-type action.
+  var replyListenersAttached = false;
+  function attachReplyListeners(innerDoc) {
+    if (replyListenersAttached) return;
+
+    // Use event delegation on the inner iframe body — catches Reply buttons
+    // regardless of their dynamic IDs or ExtJS component structure.
+    innerDoc.body.addEventListener('click', function (e) {
+      var el = e.target;
+      // Walk up a few levels to find the button element
+      for (var s = 0; s < 5; s++) {
+        if (!el || el === innerDoc.body) break;
+        var txt = (el.textContent || '').trim();
+        if (txt === 'Reply' || txt === 'Reply All' || txt === 'Forward') {
+          console.log(LOG, 'Reply/Forward click detected ("' + txt + '") — watching for compose dialog');
+          replyWatching = true;
+          return;
+        }
+        el = el.parentElement;
+      }
+    }, true); // capture phase so we see it before ExtJS
+
+    replyListenersAttached = true;
+    console.log(LOG, 'Reply button listeners attached');
   }
 
   // ── TOOLBAR COMMAND HELPER ────────────────────────────────────────────────────
@@ -200,20 +202,20 @@
     style.id  = 'uwm-ra-styles';
     style.textContent = [
 
-      /* ── Trigger button (injected into Neurons reply toolbar) ── */
+      /* ── Trigger button (injected into compose dialog RTF toolbar) ── */
       '#uwm-ra-trigger-btn {',
       '  display: inline-flex; align-items: center; gap: 5px;',
-      '  padding: 3px 10px; margin-left: 6px;',
+      '  padding: 3px 10px; margin-left: 8px;',
       '  background: #1a2744; color: #7db3e8;',
       '  border: 1px solid #2d4a7a; border-radius: 4px;',
       '  font-size: 12px; font-weight: 600; cursor: pointer;',
       '  font-family: "Segoe UI", system-ui, sans-serif;',
       '  transition: background 0.15s, color 0.15s;',
-      '  vertical-align: middle; white-space: nowrap;',
+      '  vertical-align: middle; white-space: nowrap; line-height: 1.5;',
       '}',
       '#uwm-ra-trigger-btn:hover { background: #243660; color: #a8d4f5; }',
 
-      /* ── Floating badge (bottom-right of compose dialog) ── */
+      /* ── Floating badge ── */
       '#uwm-ra-badge {',
       '  position: fixed; z-index: 999990;',
       '  background: #1a2744; color: #7db3e8;',
@@ -224,7 +226,7 @@
       '  display: flex; align-items: center; gap: 5px;',
       '  box-shadow: 0 4px 16px rgba(0,0,0,0.25);',
       '  transition: background 0.15s, transform 0.15s;',
-      '  user-select: none;',
+      '  user-select: none; bottom: 20px; right: 20px;',
       '}',
       '#uwm-ra-badge:hover { background: #243660; transform: translateY(-1px); }',
       '#uwm-ra-badge .ra-badge-dot {',
@@ -261,10 +263,7 @@
       '  padding: 12px 18px; display: flex; align-items: center; gap: 10px;',
       '  flex-shrink: 0;',
       '}',
-      '#uwm-ra-header .ra-logo {',
-      '  font-size: 13px; font-weight: 700; letter-spacing: 0.04em;',
-      '  text-transform: uppercase; opacity: 0.9;',
-      '}',
+      '#uwm-ra-header .ra-logo { font-size: 13px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; opacity: 0.9; }',
       '#uwm-ra-header .ra-header-actions { display: flex; align-items: center; gap: 6px; margin-left: auto; }',
       '#uwm-ra-header .ra-version { font-size: 11px; opacity: 0.45; }',
       '#uwm-ra-minimize-btn {',
@@ -276,8 +275,7 @@
 
       /* ── Confidence bar ── */
       '#uwm-ra-confidence {',
-      '  display: flex; align-items: center; gap: 8px;',
-      '  padding: 8px 18px; font-size: 12.5px;',
+      '  display: flex; align-items: center; gap: 8px; padding: 8px 18px; font-size: 12.5px;',
       '  border-bottom: 1px solid #e2e5ec; flex-shrink: 0; background: #fffbf0;',
       '}',
       '#uwm-ra-confidence .ra-dot { width: 11px; height: 11px; border-radius: 50%; flex-shrink: 0; }',
@@ -290,63 +288,35 @@
 
       /* ── Citations sidebar ── */
       '#uwm-ra-citations {',
-      '  width: 260px; flex-shrink: 0;',
-      '  background: #1e2b45; color: #c8d0e0;',
+      '  width: 260px; flex-shrink: 0; background: #1e2b45; color: #c8d0e0;',
       '  overflow-y: auto; padding: 14px 0; display: flex; flex-direction: column;',
       '}',
-      '#uwm-ra-citations .ra-cit-heading {',
-      '  font-size: 10px; font-weight: 700; letter-spacing: 0.1em;',
-      '  text-transform: uppercase; color: #6b7fa3; padding: 0 14px 8px 14px;',
-      '}',
+      '#uwm-ra-citations .ra-cit-heading { font-size: 10px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: #6b7fa3; padding: 0 14px 8px 14px; }',
       '.ra-cit-tier { padding: 8px 14px; border-bottom: 1px solid rgba(255,255,255,0.06); }',
-      '.ra-cit-tier-label {',
-      '  font-size: 10px; font-weight: 700; letter-spacing: 0.08em;',
-      '  text-transform: uppercase; color: #5b7fa3; margin-bottom: 5px;',
-      '}',
+      '.ra-cit-tier-label { font-size: 10px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: #5b7fa3; margin-bottom: 5px; }',
       '.ra-cit-item { margin-bottom: 8px; }',
       '.ra-cit-item a { font-size: 12px; color: #7db3e8; text-decoration: none; display: block; line-height: 1.35; }',
       '.ra-cit-item a:hover { text-decoration: underline; }',
       '.ra-cit-item .ra-cit-excerpt { font-size: 11px; color: #8a97ae; margin-top: 2px; line-height: 1.4; }',
       '.ra-cit-none { font-size: 11px; color: #4a5a72; font-style: italic; }',
-      '.ra-cit-community-note {',
-      '  font-size: 10px; color: #a08050; background: rgba(245,158,11,0.12);',
-      '  border-radius: 3px; padding: 2px 5px; margin-top: 3px; display: inline-block;',
-      '}',
+      '.ra-cit-community-note { font-size: 10px; color: #a08050; background: rgba(245,158,11,0.12); border-radius: 3px; padding: 2px 5px; margin-top: 3px; display: inline-block; }',
 
       /* ── Editor area ── */
       '#uwm-ra-editor-area { flex: 1; display: flex; flex-direction: column; overflow: hidden; background: #fff; }',
 
       /* ── Toolbar ── */
-      '#uwm-ra-toolbar {',
-      '  display: flex; align-items: center; gap: 2px; flex-wrap: wrap;',
-      '  padding: 6px 10px; border-bottom: 1px solid #e2e5ec;',
-      '  background: #f7f8fa; flex-shrink: 0;',
-      '}',
-      '.ra-tb-btn {',
-      '  background: none; border: 1px solid transparent; border-radius: 4px;',
-      '  cursor: pointer; font-size: 13px; padding: 3px 7px; color: #374151;',
-      '  transition: background 0.12s, border-color 0.12s; line-height: 1.4;',
-      '}',
+      '#uwm-ra-toolbar { display: flex; align-items: center; gap: 2px; flex-wrap: wrap; padding: 6px 10px; border-bottom: 1px solid #e2e5ec; background: #f7f8fa; flex-shrink: 0; }',
+      '.ra-tb-btn { background: none; border: 1px solid transparent; border-radius: 4px; cursor: pointer; font-size: 13px; padding: 3px 7px; color: #374151; transition: background 0.12s, border-color 0.12s; line-height: 1.4; }',
       '.ra-tb-btn:hover { background: #e5e7eb; border-color: #d0d5dd; }',
       '.ra-tb-sep { width: 1px; height: 18px; background: #d0d5dd; margin: 0 4px; }',
 
       /* ── contentEditable editor ── */
-      '#uwm-ra-editor {',
-      '  flex: 1; overflow-y: auto; padding: 14px 18px;',
-      '  font-size: 13.5px; font-family: "Segoe UI", system-ui, sans-serif;',
-      '  line-height: 1.6; color: #1f2937; outline: none; min-height: 0;',
-      '}',
-      '#uwm-ra-editor:empty:before { content: "Draft reply will appear here…"; color: #9ca3af; pointer-events: none; }',
+      '#uwm-ra-editor { flex: 1; overflow-y: auto; padding: 14px 18px; font-size: 13.5px; font-family: "Segoe UI", system-ui, sans-serif; line-height: 1.6; color: #1f2937; outline: none; min-height: 0; }',
+      '#uwm-ra-editor:empty:before { content: "Draft reply will appear here\u2026"; color: #9ca3af; pointer-events: none; }',
 
       /* ── Footer ── */
-      '#uwm-ra-footer {',
-      '  padding: 10px 16px; border-top: 1px solid #e2e5ec;',
-      '  display: flex; align-items: center; gap: 10px; background: #f7f8fa; flex-shrink: 0;',
-      '}',
-      '.ra-btn {',
-      '  padding: 7px 18px; border-radius: 6px; font-size: 13px;',
-      '  font-weight: 600; cursor: pointer; border: none; transition: background 0.15s;',
-      '}',
+      '#uwm-ra-footer { padding: 10px 16px; border-top: 1px solid #e2e5ec; display: flex; align-items: center; gap: 10px; background: #f7f8fa; flex-shrink: 0; }',
+      '.ra-btn { padding: 7px 18px; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; border: none; transition: background 0.15s; }',
       '#uwm-ra-insert { background: #1a5bb8; color: #fff; }',
       '#uwm-ra-insert:hover { background: #1549a0; }',
       '#uwm-ra-cancel { background: #e5e7eb; color: #374151; }',
@@ -354,30 +324,17 @@
 
       /* ── Thumbs ── */
       '.ra-thumbs { display: flex; gap: 6px; margin-left: auto; }',
-      '.ra-thumb-btn {',
-      '  background: none; border: 1px solid #d0d5dd; border-radius: 6px;',
-      '  cursor: pointer; font-size: 16px; padding: 4px 10px;',
-      '  transition: background 0.15s, border-color 0.15s;',
-      '}',
+      '.ra-thumb-btn { background: none; border: 1px solid #d0d5dd; border-radius: 6px; cursor: pointer; font-size: 16px; padding: 4px 10px; transition: background 0.15s, border-color 0.15s; }',
       '.ra-thumb-btn:hover { background: #e5e7eb; }',
       '.ra-thumb-btn.ra-thumb-selected { background: #dbeafe; border-color: #3b82f6; }',
 
       /* ── Searching indicator ── */
       '#uwm-ra-searching { font-size: 12px; color: #6b7fa3; margin-left: 8px; display: flex; align-items: center; gap: 6px; }',
-      '.ra-spinner {',
-      '  width: 13px; height: 13px; border: 2px solid #d0d5dd; border-top-color: #3b82f6;',
-      '  border-radius: 50%; flex-shrink: 0; animation: ra-spin 0.7s linear infinite;',
-      '}',
+      '.ra-spinner { width: 13px; height: 13px; border: 2px solid #d0d5dd; border-top-color: #3b82f6; border-radius: 50%; flex-shrink: 0; animation: ra-spin 0.7s linear infinite; }',
       '@keyframes ra-spin { to { transform: rotate(360deg); } }',
 
       /* ── Minimized bottom bar ── */
-      '#uwm-ra-minibar {',
-      '  position: fixed; bottom: 0; left: 0; right: 0; z-index: 999999;',
-      '  background: #1a2744; color: #fff;',
-      '  display: flex; align-items: center; gap: 12px; padding: 10px 20px;',
-      '  box-shadow: 0 -4px 20px rgba(0,0,0,0.3);',
-      '  font-family: "Segoe UI", system-ui, sans-serif;',
-      '}',
+      '#uwm-ra-minibar { position: fixed; bottom: 0; left: 0; right: 0; z-index: 999999; background: #1a2744; color: #fff; display: flex; align-items: center; gap: 12px; padding: 10px 20px; box-shadow: 0 -4px 20px rgba(0,0,0,0.3); font-family: "Segoe UI", system-ui, sans-serif; }',
       '#uwm-ra-minibar.ra-hidden { display: none; }',
       '#uwm-ra-minibar .ra-mini-icon { font-size: 16px; opacity: 0.8; }',
       '#uwm-ra-minibar .ra-mini-label { font-size: 13px; font-weight: 600; letter-spacing: 0.02em; }',
@@ -389,21 +346,12 @@
       '#uwm-ra-mini-discard:hover { background: rgba(255,80,80,0.2); }',
 
       /* ── Cancel warning dialog ── */
-      '#uwm-ra-warn-overlay {',
-      '  position: fixed; inset: 0; z-index: 1000000;',
-      '  background: rgba(15,20,30,0.65);',
-      '  display: flex; align-items: center; justify-content: center;',
-      '  font-family: "Segoe UI", system-ui, sans-serif;',
-      '}',
-      '#uwm-ra-warn-box {',
-      '  background: #fff; border-radius: 10px; padding: 28px 32px;',
-      '  width: 400px; max-width: 92vw;',
-      '  box-shadow: 0 16px 48px rgba(0,0,0,0.3); border: 1px solid #e2e5ec;',
-      '}',
+      '#uwm-ra-warn-overlay { position: fixed; inset: 0; z-index: 1000000; background: rgba(15,20,30,0.65); display: flex; align-items: center; justify-content: center; font-family: "Segoe UI", system-ui, sans-serif; }',
+      '#uwm-ra-warn-box { background: #fff; border-radius: 10px; padding: 28px 32px; width: 400px; max-width: 92vw; box-shadow: 0 16px 48px rgba(0,0,0,0.3); border: 1px solid #e2e5ec; }',
       '#uwm-ra-warn-box h3 { margin: 0 0 10px 0; font-size: 16px; color: #111827; }',
       '#uwm-ra-warn-box p { margin: 0 0 22px 0; font-size: 13.5px; color: #6b7280; line-height: 1.5; }',
       '#uwm-ra-warn-box .ra-warn-actions { display: flex; gap: 10px; justify-content: flex-end; }',
-      '#uwm-ra-warn-keep    { background: #e5e7eb; color: #374151; }',
+      '#uwm-ra-warn-keep { background: #e5e7eb; color: #374151; }',
       '#uwm-ra-warn-keep:hover { background: #d1d5db; }',
       '#uwm-ra-warn-confirm { background: #dc2626; color: #fff; }',
       '#uwm-ra-warn-confirm:hover { background: #b91c1c; }',
@@ -413,47 +361,52 @@
   }
 
   // ── REMOVE TRIGGERS ───────────────────────────────────────────────────────────
-  // Cleans up the toolbar button and floating badge when the compose dialog closes.
   function removeTriggers() {
-    var btn   = document.getElementById('uwm-ra-trigger-btn');
+    // Toolbar button lives in the inner iframe document
+    var innerDoc = getInnerDoc();
+    if (innerDoc) {
+      var btn = innerDoc.getElementById('uwm-ra-trigger-btn');
+      if (btn) btn.remove();
+    }
+    // Badge lives in the outer document
     var badge = document.getElementById('uwm-ra-badge');
-    if (btn)   btn.remove();
     if (badge) badge.remove();
   }
 
-  // ── INJECT TRIGGER BUTTON INTO NEURONS REPLY TOOLBAR ─────────────────────────
-  // Finds the toolbar row containing Reply / Reply All / Forward buttons inside
-  // the email viewer/compose area and appends our button to it.
-  // The toolbar is inside the inner iframe, so we search innerDoc, not document.
-  function injectToolbarButton(innerDoc, onClickFn) {
-    // Guard: only inject once
+  // ── INJECT TOOLBAR BUTTON INTO COMPOSE DIALOG ─────────────────────────────────
+  // Injects the "AI Assistant" button into the compose dialog's own RTF toolbar,
+  // NOT into the viewer's Reply/Forward toolbar. This keeps the button visible
+  // for exactly as long as the compose dialog is open, and nowhere else.
+  //
+  // The compose dialog's RTF toolbar is found by looking for the ExtJS HTML editor
+  // toolbar inside the dialog element itself (class patterns: x-html-editor-tb,
+  // or the toolbar row containing the bold/italic buttons).
+  function injectToolbarButton(dialogEl, innerDoc, onClickFn) {
+    // Guard: only inject once per dialog
     if (innerDoc.getElementById('uwm-ra-trigger-btn')) return;
 
-    // Find the toolbar that contains Reply/Reply All/Forward.
-    // Neurons renders these as .x-toolbar or a div containing .x-btn elements.
-    // We look for any element containing a button with text "Reply".
-    var replyBtn = null;
-    var allBtns  = innerDoc.querySelectorAll('button, .x-btn-text, td.x-btn-mc');
-    for (var i = 0; i < allBtns.length; i++) {
-      var t = (allBtns[i].textContent || '').trim();
-      if (t === 'Reply' || t === 'Reply All') { replyBtn = allBtns[i]; break; }
-    }
+    // Find the RTF formatting toolbar inside the compose dialog.
+    // Try known ExtJS HTML editor toolbar class first.
+    var toolbar = dialogEl.querySelector('.x-html-editor-tb');
 
-    if (!replyBtn) {
-      console.log(LOG, 'Could not find Reply button in toolbar — badge only');
-      return;
-    }
-
-    // Walk up to find the toolbar container (a tr or div holding all the buttons)
-    var toolbar = replyBtn;
-    for (var s = 0; s < 6; s++) {
-      if (!toolbar.parentElement) break;
-      toolbar = toolbar.parentElement;
-      var tag = toolbar.tagName.toLowerCase();
-      if (tag === 'tr' || tag === 'div' || tag === 'td') {
-        // Check if this container also holds Forward — then we know it's the right level
-        var text = toolbar.textContent || '';
-        if (text.indexOf('Forward') !== -1 || text.indexOf('Reply All') !== -1) break;
+    // Fallback: find the first toolbar-like container inside the dialog
+    // that contains a bold/italic button
+    if (!toolbar) {
+      var allBtns = dialogEl.querySelectorAll('button, .x-btn-text, td.x-btn-mc');
+      for (var i = 0; i < allBtns.length; i++) {
+        var txt = (allBtns[i].textContent || '').trim().toLowerCase();
+        var ttl = (allBtns[i].title || '').trim().toLowerCase();
+        if (txt === 'bold' || ttl === 'bold' || txt === 'italic' || ttl === 'italic') {
+          // Walk up to find a row or toolbar container
+          toolbar = allBtns[i].parentElement;
+          for (var s = 0; s < 4; s++) {
+            if (!toolbar || toolbar === dialogEl) break;
+            var tag = toolbar.tagName.toLowerCase();
+            if (tag === 'tr' || tag === 'div' || tag === 'ul') break;
+            toolbar = toolbar.parentElement;
+          }
+          break;
+        }
       }
     }
 
@@ -461,42 +414,29 @@
     btn.id  = 'uwm-ra-trigger-btn';
     btn.innerHTML = '&#10022; AI Assistant';
     btn.title = 'Open Reply Assistant';
-    // Button must live in the inner iframe's document but click handler
-    // can call functions in the outer scope via closure.
     btn.addEventListener('click', function (e) {
       e.stopPropagation();
       onClickFn();
     });
 
-    // Append after the toolbar container's last child, or after the Reply button
-    try {
+    if (toolbar) {
       toolbar.appendChild(btn);
-      console.log(LOG, 'Trigger button injected into reply toolbar');
-    } catch (e) {
-      console.warn(LOG, 'Toolbar injection failed:', e);
+      console.log(LOG, 'Trigger button injected into compose RTF toolbar');
+    } else {
+      // Last resort: append to the dialog element directly
+      dialogEl.appendChild(btn);
+      console.log(LOG, 'Trigger button injected into dialog (toolbar not found)');
     }
   }
 
   // ── INJECT FLOATING BADGE ─────────────────────────────────────────────────────
-  // Injects a small floating badge into the outer document positioned near the
-  // bottom-right of the viewport. The badge is in the outer document (not the
-  // inner iframe) so it can overlay the Neurons compose dialog cleanly.
   function injectBadge(onClickFn) {
     if (document.getElementById('uwm-ra-badge')) return;
-
     var badge = document.createElement('div');
     badge.id  = 'uwm-ra-badge';
     badge.innerHTML = '<span class="ra-badge-dot"></span>&#10022; Reply Assistant';
     badge.title = 'Open Reply Assistant';
-
-    // Position: fixed bottom-right, above where the minibar would appear
-    badge.style.bottom = '20px';
-    badge.style.right  = '20px';
-
-    badge.addEventListener('click', function () {
-      onClickFn();
-    });
-
+    badge.addEventListener('click', function () { onClickFn(); });
     document.body.appendChild(badge);
     console.log(LOG, 'Floating badge injected');
   }
@@ -508,7 +448,7 @@
     var badge   = document.getElementById('uwm-ra-badge');
     if (overlay) overlay.classList.add('ra-hidden');
     if (minibar) minibar.classList.remove('ra-hidden');
-    if (badge)   badge.style.display = 'none'; // hide badge while minibar is showing
+    if (badge)   badge.style.display = 'none';
     isMinimized = true;
     console.log(LOG, 'Pop-up minimized — draft preserved');
   }
@@ -531,10 +471,8 @@
     if (overlay) overlay.remove();
     if (minibar) minibar.remove();
     if (warn)    warn.remove();
-    // NOTE: do NOT reset seenDialogs here. The compose dialog is still open in
-    // Neurons. seenDialogs is only cleared by the cleanup poller when Neurons
-    // actually removes the dialog from the DOM (i.e. user clicks Save/Cancel
-    // in Neurons itself). This prevents the re-fire bug from v1.8.
+    // Do NOT reset seenDialogs here — the compose dialog may still be open.
+    // seenDialogs is only cleared by the cleanup poller when Neurons closes it.
     popupActive = false;
     isMinimized = false;
     if (escListener) {
@@ -544,7 +482,7 @@
     console.log(LOG, 'Pop-up closed');
   }
 
-  // ── CANCEL WARNING DIALOG ─────────────────────────────────────────────────────
+  // ── CANCEL WARNING ────────────────────────────────────────────────────────────
   function showCancelWarning() {
     if (isMinimized) restorePopup();
     var warn = document.createElement('div');
@@ -552,7 +490,7 @@
     warn.innerHTML = [
       '<div id="uwm-ra-warn-box">',
         '<h3>Discard this draft?</h3>',
-        '<p>Your draft reply and any edits you\'ve made will be permanently lost. This cannot be undone.</p>',
+        '<p>Your draft reply and any edits will be permanently lost. This cannot be undone.</p>',
         '<div class="ra-warn-actions">',
           '<button class="ra-btn" id="uwm-ra-warn-keep">Keep editing</button>',
           '<button class="ra-btn" id="uwm-ra-warn-confirm">Yes, discard draft</button>',
@@ -560,34 +498,62 @@
       '</div>'
     ].join('');
     document.body.appendChild(warn);
-
-    document.getElementById('uwm-ra-warn-keep').addEventListener('click', function () {
-      warn.remove();
-    });
+    document.getElementById('uwm-ra-warn-keep').addEventListener('click', function () { warn.remove(); });
     document.getElementById('uwm-ra-warn-confirm').addEventListener('click', function () {
       console.log(LOG, 'Draft discarded by user confirmation');
       closePopup();
     });
-    warn.addEventListener('click', function (e) {
-      if (e.target === warn) warn.remove();
-    });
+    warn.addEventListener('click', function (e) { if (e.target === warn) warn.remove(); });
+  }
+
+  // ── INSERT DRAFT AT TOP ───────────────────────────────────────────────────────
+  // Prepends the draft HTML to the Neurons editor body WITHOUT overwriting
+  // existing content (signature, email thread). The draft nodes are inserted
+  // before the first child of the editor body, so they appear at the very top.
+  function insertDraftAtTop(editorIframe, draftHtml) {
+    var editorBody = editorIframe.contentDocument.body;
+    var editorDoc  = editorIframe.contentDocument;
+
+    // Parse the draft HTML into a temporary container
+    var temp = editorDoc.createElement('div');
+    temp.innerHTML = draftHtml;
+
+    // Insert each node from the draft before the first existing child
+    // (prepend in order, so the draft reads top-to-bottom correctly)
+    var firstChild = editorBody.firstChild;
+    var nodes      = Array.prototype.slice.call(temp.childNodes);
+
+    if (firstChild) {
+      for (var i = 0; i < nodes.length; i++) {
+        editorBody.insertBefore(nodes[i], firstChild);
+      }
+    } else {
+      // Body is empty — just append
+      for (var j = 0; j < nodes.length; j++) {
+        editorBody.appendChild(nodes[j]);
+      }
+    }
+
+    // Notify Neurons that the content changed
+    var evt = editorDoc.createEvent('Event');
+    evt.initEvent('input', true, true);
+    editorBody.dispatchEvent(evt);
+
+    console.log(LOG, 'Draft prepended at top of Neurons compose editor (' + draftHtml.length + ' chars)');
   }
 
   // ── POP-UP UI ─────────────────────────────────────────────────────────────────
   function showPopup(dialogEl, thread) {
     if (popupActive) {
-      // If already open and user clicks the trigger again, restore if minimized
       if (isMinimized) restorePopup();
       return;
     }
     popupActive = true;
     injectStyles();
 
-    // Hide the badge while the pop-up is open (not minimized)
     var badge = document.getElementById('uwm-ra-badge');
     if (badge) badge.style.display = 'none';
 
-    // ── Overlay ───────────────────────────────────────────────────────────────
     var overlay = document.createElement('div');
     overlay.id  = 'uwm-ra-overlay';
     overlay.innerHTML = [
@@ -598,13 +564,10 @@
             '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
           '</svg>',
           '<span class="ra-logo">Reply Assistant</span>',
-          '<span id="uwm-ra-searching">',
-            '<span class="ra-spinner"></span>',
-            'Searching knowledge base\u2026',
-          '</span>',
+          '<span id="uwm-ra-searching"><span class="ra-spinner"></span>Searching knowledge base\u2026</span>',
           '<div class="ra-header-actions">',
-            '<button id="uwm-ra-minimize-btn" title="Minimize \u2014 draft will be preserved">\u2013</button>',
-            '<span class="ra-version">v1.10</span>',
+            '<button id="uwm-ra-minimize-btn" title="Minimize \u2014 draft preserved">\u2013</button>',
+            '<span class="ra-version">v1.11</span>',
           '</div>',
         '</div>',
 
@@ -620,45 +583,26 @@
             '<div class="ra-cit-heading">Sources Consulted</div>',
             '<div class="ra-cit-tier">',
               '<div class="ra-cit-tier-label">Tier 1 \u2014 UWM Knowledge Base</div>',
-              '<div class="ra-cit-item">',
-                '<a href="https://kb.uwm.edu" target="_blank">Setting Up Your Canvas Course Site</a>',
-                '<div class="ra-cit-excerpt">Step-by-step guide to course creation, enrollment sync, and template use for UWM instructors.</div>',
-              '</div>',
-              '<div class="ra-cit-item">',
-                '<a href="https://kb.uwm.edu" target="_blank">Canvas \u2014 Adding a TA or Co-instructor</a>',
-                '<div class="ra-cit-excerpt">How to request additional user roles in a Canvas course site via the UWM enrollment system.</div>',
-              '</div>',
+              '<div class="ra-cit-item"><a href="https://kb.uwm.edu" target="_blank">Setting Up Your Canvas Course Site</a><div class="ra-cit-excerpt">Step-by-step guide to course creation, enrollment sync, and template use for UWM instructors.</div></div>',
+              '<div class="ra-cit-item"><a href="https://kb.uwm.edu" target="_blank">Canvas \u2014 Adding a TA or Co-instructor</a><div class="ra-cit-excerpt">How to request additional user roles in a Canvas course site via the UWM enrollment system.</div></div>',
             '</div>',
-            '<div class="ra-cit-tier">',
-              '<div class="ra-cit-tier-label">Tier 2 \u2014 UWM Web</div>',
-              '<div class="ra-cit-none">Searched \u2014 no results found</div>',
-            '</div>',
+            '<div class="ra-cit-tier"><div class="ra-cit-tier-label">Tier 2 \u2014 UWM Web</div><div class="ra-cit-none">Searched \u2014 no results found</div></div>',
             '<div class="ra-cit-tier">',
               '<div class="ra-cit-tier-label">Tier 3 \u2014 UW System KB</div>',
-              '<div class="ra-cit-item">',
-                '<a href="https://kb.wisconsin.edu" target="_blank">Canvas LTI Tool Availability \u2014 UW System</a>',
-                '<div class="ra-cit-excerpt">Which LTI integrations are enabled system-wide vs. configured at the institution level.</div>',
-              '</div>',
+              '<div class="ra-cit-item"><a href="https://kb.wisconsin.edu" target="_blank">Canvas LTI Tool Availability \u2014 UW System</a><div class="ra-cit-excerpt">Which LTI integrations are enabled system-wide vs. configured at the institution level.</div></div>',
             '</div>',
             '<div class="ra-cit-tier">',
               '<div class="ra-cit-tier-label">Tier 4 \u2014 Canvas Community</div>',
-              '<div class="ra-cit-item">',
-                '<a href="https://community.instructure.com" target="_blank">How do I add files to a course? [Solved]</a>',
-                '<div class="ra-cit-excerpt">Official Instructure documentation on the Canvas Files tool, upload limits, and folder structure.</div>',
-                '<div class="ra-cit-community-note">&#9873; Peer-generated community thread</div>',
-              '</div>',
+              '<div class="ra-cit-item"><a href="https://community.instructure.com" target="_blank">How do I add files to a course? [Solved]</a><div class="ra-cit-excerpt">Official Instructure documentation on the Canvas Files tool, upload limits, and folder structure.</div><div class="ra-cit-community-note">&#9873; Peer-generated community thread</div></div>',
             '</div>',
-            '<div class="ra-cit-tier" style="border-bottom:none;">',
-              '<div class="ra-cit-tier-label">Memory Store</div>',
-              '<div class="ra-cit-none">No similar past answers found</div>',
-            '</div>',
+            '<div class="ra-cit-tier" style="border-bottom:none;"><div class="ra-cit-tier-label">Memory Store</div><div class="ra-cit-none">No similar past answers found</div></div>',
           '</div>',
 
           '<div id="uwm-ra-editor-area">',
             '<div id="uwm-ra-toolbar">',
-              '<button class="ra-tb-btn" data-cmd="bold"               title="Bold"><b>B</b></button>',
-              '<button class="ra-tb-btn" data-cmd="italic"             title="Italic"><i>I</i></button>',
-              '<button class="ra-tb-btn" data-cmd="underline"          title="Underline"><u>U</u></button>',
+              '<button class="ra-tb-btn" data-cmd="bold"                title="Bold"><b>B</b></button>',
+              '<button class="ra-tb-btn" data-cmd="italic"              title="Italic"><i>I</i></button>',
+              '<button class="ra-tb-btn" data-cmd="underline"           title="Underline"><u>U</u></button>',
               '<div class="ra-tb-sep"></div>',
               '<button class="ra-tb-btn" data-cmd="insertUnorderedList" title="Bullet list">&#8226; List</button>',
               '<button class="ra-tb-btn" data-cmd="insertOrderedList"   title="Numbered list">1. List</button>',
@@ -685,7 +629,6 @@
     ].join('');
     document.body.appendChild(overlay);
 
-    // ── Minibar (hidden initially) ────────────────────────────────────────────
     var minibar = document.createElement('div');
     minibar.id  = 'uwm-ra-minibar';
     minibar.classList.add('ra-hidden');
@@ -698,7 +641,7 @@
     ].join('');
     document.body.appendChild(minibar);
 
-    // ── Placeholder draft ─────────────────────────────────────────────────────
+    // Placeholder draft
     document.getElementById('uwm-ra-editor').innerHTML = [
       '<p>Hi [Instructor Name],</p>',
       '<p>Thank you for reaching out to UWM CETL support.</p>',
@@ -712,7 +655,7 @@
       '<p>Best,<br>Lane<br>CETL Teaching, Learning &amp; Technology Consultant</p>'
     ].join('');
 
-    // ── Toolbar wiring ────────────────────────────────────────────────────────
+    // Toolbar wiring
     var tbBtns = document.querySelectorAll('#uwm-ra-toolbar .ra-tb-btn[data-cmd]');
     for (var t = 0; t < tbBtns.length; t++) {
       (function (btn) {
@@ -728,16 +671,15 @@
       if (url && url !== 'https://') execCmd('createLink', url);
     });
 
-    // ── Simulated search complete ─────────────────────────────────────────────
+    // Simulated search complete
     setTimeout(function () {
       var el = document.getElementById('uwm-ra-searching');
       if (el) el.innerHTML = '<span style="color:#4ade80;font-size:12px;">&#10003; Search complete</span>';
     }, 2000);
 
-    // ── Minimize button ───────────────────────────────────────────────────────
     document.getElementById('uwm-ra-minimize-btn').addEventListener('click', minimizePopup);
 
-    // ── Insert ────────────────────────────────────────────────────────────────
+    // Insert — prepends to top, never overwrites
     document.getElementById('uwm-ra-insert').addEventListener('click', function () {
       var html = document.getElementById('uwm-ra-editor').innerHTML;
       if (!html || !html.trim()) {
@@ -751,12 +693,7 @@
         return;
       }
       try {
-        var editorBody = editorIframe.contentDocument.body;
-        editorBody.innerHTML = html;
-        var evt = editorIframe.contentDocument.createEvent('Event');
-        evt.initEvent('input', true, true);
-        editorBody.dispatchEvent(evt);
-        console.log(LOG, 'Draft inserted (' + html.length + ' chars)');
+        insertDraftAtTop(editorIframe, html);
         closePopup();
         removeTriggers();
       } catch (e) {
@@ -765,10 +702,8 @@
       }
     });
 
-    // ── Cancel → warning ──────────────────────────────────────────────────────
     document.getElementById('uwm-ra-cancel').addEventListener('click', showCancelWarning);
 
-    // ── Thumbs ────────────────────────────────────────────────────────────────
     document.getElementById('uwm-ra-thumb-up').addEventListener('click', function () {
       this.classList.toggle('ra-thumb-selected');
       document.getElementById('uwm-ra-thumb-down').classList.remove('ra-thumb-selected');
@@ -780,12 +715,10 @@
       console.log(LOG, 'Thumbs down');
     });
 
-    // ── Overlay click → minimize ──────────────────────────────────────────────
     overlay.addEventListener('click', function (e) {
       if (e.target === overlay) minimizePopup();
     });
 
-    // ── Esc → minimize/restore toggle ────────────────────────────────────────
     escListener = function (e) {
       if (e.key === 'Escape' || e.keyCode === 27) {
         if (!popupActive) return;
@@ -794,7 +727,6 @@
     };
     document.addEventListener('keydown', escListener);
 
-    // ── Minibar buttons ───────────────────────────────────────────────────────
     document.getElementById('uwm-ra-mini-restore').addEventListener('click', restorePopup);
     document.getElementById('uwm-ra-mini-discard').addEventListener('click', function () {
       console.log(LOG, 'Draft discarded from minibar');
@@ -806,42 +738,44 @@
   }
 
   // ── HANDLE COMPOSE DIALOG ─────────────────────────────────────────────────────
-  // Called when a new .x-frs-modal-form is found. Instead of auto-opening the
-  // pop-up, it injects the trigger button and badge, then waits for user action.
+  // Only called when replyWatching is true (i.e. after a Reply/Forward click).
+  // Confirms the dialog is a compose dialog via RTF toolbar detection, then
+  // injects triggers and starts the cleanup poller.
   function handleDialog(dialogEl, innerDoc) {
     if (seenDialogs[dialogEl.id]) return;
+
+    // Only proceed if the user clicked Reply/Reply All/Forward first
+    if (!replyWatching) return;
+
     if (!isComposeDialog(dialogEl)) return;
 
+    // Confirmed compose dialog — consume the replyWatching flag
+    replyWatching = false;
     seenDialogs[dialogEl.id] = true;
-    console.log(LOG, 'Compose dialog detected (id=' + dialogEl.id + ') — injecting triggers');
+    console.log(LOG, 'Compose dialog confirmed (id=' + dialogEl.id + ') — injecting triggers');
 
     var thread = readEmailThread(innerDoc);
 
-    // The trigger callback: called when user clicks toolbar button or badge
     function openAssistant() {
       showPopup(dialogEl, thread);
     }
 
-    // Inject toolbar button (inside inner iframe) and badge (outer document)
-    injectToolbarButton(innerDoc, openAssistant);
+    // Inject button into compose dialog's RTF toolbar (not the viewer toolbar)
+    injectToolbarButton(dialogEl, innerDoc, openAssistant);
     injectBadge(openAssistant);
 
-    // ── Cleanup poller: watch for Neurons to close the compose dialog ─────────
-    // When the dialog disappears from the DOM, clean up triggers and reset
-    // seenDialogs so the next Reply click starts fresh.
+    // Cleanup poller — watch for Neurons to close the compose dialog
     if (cleanPoller) clearInterval(cleanPoller);
     cleanPoller = setInterval(function () {
       var currentDoc = getInnerDoc();
       if (!currentDoc) return;
-      // If the dialog element is no longer in the DOM, the user closed it in Neurons
-      if (!currentDoc.getElementById(dialogEl.id) && !currentDoc.body.contains(dialogEl)) {
+      if (!currentDoc.body.contains(dialogEl)) {
         clearInterval(cleanPoller);
         cleanPoller = null;
-        // Safe to reset now — the compose dialog is truly gone
         delete seenDialogs[dialogEl.id];
         removeTriggers();
         if (popupActive) closePopup();
-        console.log(LOG, 'Compose dialog closed by Neurons — triggers removed, ready for next reply');
+        console.log(LOG, 'Compose dialog closed — ready for next reply');
       }
     }, 800);
   }
@@ -852,6 +786,13 @@
     pollInterval = setInterval(function () {
       var innerDoc = getInnerDoc();
       if (!innerDoc) return;
+
+      // Attach Reply button listeners once the inner doc is ready
+      attachReplyListeners(innerDoc);
+
+      // Only scan for dialogs when we're actively watching for one
+      if (!replyWatching) return;
+
       var dialogs = innerDoc.querySelectorAll('.x-frs-modal-form');
       for (var i = 0; i < dialogs.length; i++) {
         handleDialog(dialogs[i], innerDoc);
@@ -863,6 +804,7 @@
   function startObserver(innerDoc) {
     if (observerRef) { try { observerRef.disconnect(); } catch (e) {} }
     observerRef = new MutationObserver(function () {
+      if (!replyWatching) return; // ignore mutations unless we're watching for a compose dialog
       var currentDoc = getInnerDoc();
       if (!currentDoc) return;
       var dialogs = currentDoc.querySelectorAll('.x-frs-modal-form');
@@ -886,9 +828,10 @@
       if (initAttempts < 30) setTimeout(init, 500);
       return;
     }
+    attachReplyListeners(innerDoc);
     startObserver(innerDoc);
     startPoller();
-    console.log(LOG, 'v1.10 initialized');
+    console.log(LOG, 'v1.11 initialized');
   }
 
   if (document.readyState === 'loading') {
