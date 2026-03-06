@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Neurons - Reply Assistant
 // @namespace    https://uwm-amc.ivanticloud.com/
-// @version      1.15
+// @version      1.13
 // @description  Detects reply/compose dialog via RTF toolbar, injects triggers on Reply click only.
 // @match        https://uwm-amc.ivanticloud.com/*
 // @grant        none
@@ -102,25 +102,15 @@
   }
 
   // ── FIND COMPOSE EDITOR IFRAME ────────────────────────────────────────────────
-  // When two dialogs are stacked (viewer + compose), we must target the compose
-  // dialog's editor, not the viewer's. The compose editor body is contentEditable;
-  // the viewer body is read-only. We prefer the editable iframe, falling back to
-  // the first accessible iframe if none are explicitly editable.
   function getEditorIframe(dialogEl) {
     var iframes = dialogEl.querySelectorAll('iframe');
-    var fallback = null;
     for (var i = 0; i < iframes.length; i++) {
       try {
         var doc = iframes[i].contentDocument;
-        if (!doc || !doc.body) continue;
-        // Prefer an iframe whose body is truly content-editable
-        if (doc.body.isContentEditable || doc.body.contentEditable === 'true') {
-          return iframes[i]; // definitive match
-        }
-        if (!fallback) fallback = iframes[i]; // keep first accessible as fallback
+        if (doc && doc.body) return iframes[i];
       } catch (e) {}
     }
-    return fallback;
+    return null;
   }
 
   // ── IS COMPOSE DIALOG? ────────────────────────────────────────────────────────
@@ -555,7 +545,7 @@
           '<span id="uwm-ra-searching"><span class="ra-spinner"></span>Searching knowledge base\u2026</span>',
           '<div class="ra-header-actions">',
             '<button id="uwm-ra-minimize-btn" title="Minimize \u2014 draft preserved">\u2013</button>',
-            '<span class="ra-version">v1.15</span>',
+            '<span class="ra-version">v1.13</span>',
           '</div>',
         '</div>',
 
@@ -668,28 +658,18 @@
     document.getElementById('uwm-ra-minimize-btn').addEventListener('click', minimizePopup);
 
     // Insert — prepends to top, never overwrites
-    // Re-fetches the compose dialog by its ID from the current inner iframe DOM
-    // at insert time to guarantee we target the right dialog, not the viewer.
     document.getElementById('uwm-ra-insert').addEventListener('click', function () {
       var html = document.getElementById('uwm-ra-editor').innerHTML;
       if (!html || !html.trim()) {
         alert('[UWM Reply Assistant] Nothing to insert \u2014 the editor is empty.');
         return;
       }
-      // Re-fetch the compose dialog from the live DOM by its captured ID.
-      // This ensures we always target the correct dialog even when multiple
-      // .x-frs-modal-form dialogs are stacked (viewer + compose).
-      var currentInnerDoc = getInnerDoc();
-      var freshDialog = currentInnerDoc ? currentInnerDoc.getElementById(dialogEl.id) : null;
-      var targetDialog = freshDialog || dialogEl; // fallback to captured ref
-
-      var editorIframe = getEditorIframe(targetDialog);
+      var editorIframe = getEditorIframe(dialogEl);
       if (!editorIframe) {
         alert('[UWM Reply Assistant] Could not find the Neurons compose editor. The dialog may have closed.');
         closePopup();
         return;
       }
-      console.log(LOG, 'Inserting into dialog id=' + targetDialog.id + ', iframe body editable=' + (editorIframe.contentDocument && editorIframe.contentDocument.body ? editorIframe.contentDocument.body.isContentEditable : 'unknown'));
       try {
         insertDraftAtTop(editorIframe, html);
         closePopup();
@@ -788,71 +768,50 @@
   }
 
   // ── POLL FALLBACK ────────────────────────────────────────────────────────────
-  // SNAPSHOT TIMING FIX (v1.14):
-  // The viewer dialog opens AFTER page load, so a one-shot snapshot at init
-  // misses it (snapshot = 0 dialogs). We need to snapshot the viewer dialog
-  // before watching for new ones.
-  //
-  // Strategy: "stabilisation window"
-  //   - Track when each dialog ID is first seen (firstSeenAt timestamp)
-  //   - A dialog is "stable" (treated as pre-existing/viewer) if it was first
-  //     seen more than STABLE_MS milliseconds ago
-  //   - Only dialogs seen for the FIRST TIME within the last STABLE_MS are
-  //     treated as newly-created reply dialogs
-  //   - STABLE_MS = 2000ms — long enough for the viewer to finish opening,
-  //     short enough to catch a Reply dialog within normal interaction speed
-  //
-  // This means: if you open an email and wait >2s before clicking Reply,
-  // the viewer dialog is "stable" and ignored. The reply dialog appears fresh.
-  var firstSeenAt   = {};   // dialogId → timestamp when first observed
-  var STABLE_MS     = 2000; // dialogs older than this are treated as pre-existing
-  var snapshotTaken = true; // no longer used as a gate, kept for observer compat
-
+  // On the first poll, snapshots all existing dialog IDs into knownDialogIds.
+  // Subsequent polls only call handleDialog() for NEW dialogs not in that set.
+  var snapshotTaken = false;
   function startPoller() {
     if (pollInterval) clearInterval(pollInterval);
     pollInterval = setInterval(function () {
       var innerDoc = getInnerDoc();
       if (!innerDoc) return;
       var dialogs = innerDoc.querySelectorAll('.x-frs-modal-form');
-      var now = Date.now();
+
+      // Take snapshot of pre-existing dialogs on first run
+      if (!snapshotTaken) {
+        for (var s = 0; s < dialogs.length; s++) {
+          knownDialogIds[dialogs[s].id] = true;
+        }
+        snapshotTaken = true;
+        console.log(LOG, 'Snapshot taken — ' + dialogs.length + ' pre-existing dialog(s) ignored');
+        return;
+      }
 
       for (var i = 0; i < dialogs.length; i++) {
-        var d   = dialogs[i];
-        var did = d.id;
-
-        // Record first-seen time for every dialog we encounter
-        if (!firstSeenAt[did]) {
-          firstSeenAt[did] = now;
-          console.log(LOG, 'Dialog first seen: ' + did + ' (stabilising for ' + STABLE_MS + 'ms)');
-          continue; // don't act on it yet — give it time to stabilise
-        }
-
-        // If the dialog has been visible for < STABLE_MS, it's still new — check it
-        var age = now - firstSeenAt[did];
-        if (age < STABLE_MS) {
-          // It's new enough to be a reply dialog — try to handle it
-          handleDialog(d, innerDoc);
-        }
-        // If age >= STABLE_MS and not yet in seenDialogs, add to knownDialogIds
-        // so it is permanently ignored as a pre-existing viewer dialog
-        else if (!seenDialogs[did] && !knownDialogIds[did]) {
-          knownDialogIds[did] = true;
-          console.log(LOG, 'Dialog stabilised as viewer/pre-existing: ' + did);
-        }
+        handleDialog(dialogs[i], innerDoc);
       }
     }, 500);
   }
 
   // ── MUTATION OBSERVER ────────────────────────────────────────────────────────
-  // REMOVED in v1.15. The MutationObserver fired at ~300ms after a dialog
-  // appeared, defeating the 2000ms stabilisation window that distinguishes the
-  // viewer dialog (pre-existing) from the reply dialog (new). The poller alone
-  // is sufficient — it detects new dialogs within 500ms, which is fast enough
-  // for the Reply workflow. Using only the poller ensures the stabilisation
-  // window is always respected before handleDialog() is called.
+  // Watches for new dialogs appearing in the DOM. handleDialog() skips any dialog
+  // whose ID is in knownDialogIds (pre-existing viewer dialogs).
   function startObserver(innerDoc) {
-    // Intentionally empty — detection is handled entirely by startPoller().
-    console.log(LOG, 'Observer skipped — poller-only mode (v1.15)');
+    if (observerRef) { try { observerRef.disconnect(); } catch (e) {} }
+    observerRef = new MutationObserver(function () {
+      var currentDoc = getInnerDoc();
+      if (!currentDoc) return;
+      if (!snapshotTaken) return; // wait for snapshot before processing mutations
+      var dialogs = currentDoc.querySelectorAll('.x-frs-modal-form');
+      for (var i = 0; i < dialogs.length; i++) {
+        (function (el, doc) {
+          setTimeout(function () { handleDialog(el, doc); }, 300);
+        }(dialogs[i], currentDoc));
+      }
+    });
+    observerRef.observe(innerDoc.body, { childList: true, subtree: true });
+    console.log(LOG, 'MutationObserver attached');
   }
 
   // ── INIT ─────────────────────────────────────────────────────────────────────
@@ -867,7 +826,7 @@
     }
     startObserver(innerDoc);
     startPoller();
-    console.log(LOG, 'v1.15 initialized — poller-only detection, 2s stabilisation window');
+    console.log(LOG, 'v1.13 initialized');
   }
 
   if (document.readyState === 'loading') {
