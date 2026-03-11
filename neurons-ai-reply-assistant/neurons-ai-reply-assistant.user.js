@@ -1,47 +1,30 @@
 // ==UserScript==
 // @name         Neurons - Reply Assistant
 // @namespace    https://uwm-amc.ivanticloud.com/
-// @version      1.20
+// @version      1.21
 // @description  Detects reply/compose dialog, injects AI-assist pop-up with native contentEditable editor.
 // @match        https://uwm-amc.ivanticloud.com/*
 // @grant        none
 // @run-at       document-idle
 // ==/UserScript==
 
-// ── CHANGES IN v1.20 ─────────────────────────────────────────────────────────
+// ── CHANGES IN v1.21 ─────────────────────────────────────────────────────────
 //
-// FIX 1 — Console spam / script running continuously:
-//   The viewer dialog (ext-comp-2850) was not in knownDialogIds because it
-//   appeared AFTER the 5-second grace period ended. The poller then called
-//   isComposeDialog() on it every 500ms forever, logging "no editable iframe"
-//   each time. It was correctly rejected each time (no insert happened), but
-//   the repeated evaluation produced 100s of console lines and wasted CPU.
+// FIX 1 — Badge disappears after Insert:
+//   showPopup() hides the badge with badge.style.display = 'none' while the
+//   panel is open. closePopup() was not restoring it. Fix: closePopup() now
+//   calls restoreBadge() which sets badge.style.display = '' so it reappears.
 //
-//   Fix: Any dialog that fails isComposeDialog() is immediately added to
-//   knownDialogIds so it is never evaluated again. This is safe because:
-//   - A viewer dialog that fails the check will never become a compose dialog
-//   - The compose dialog (when it appears) will pass the check and get triggers
-//   - seenDialogs already prevents re-processing dialogs that pass the check
-//   Combined: every dialog is evaluated exactly once, then filed away.
+// FIX 2 — Badge and button disappear after Discard from minibar:
+//   The minibar Discard handler was calling removeTriggers() after closePopup().
+//   Triggers (badge + button) should only be removed when the Neurons compose
+//   dialog itself closes — not when the user discards a draft. The compose
+//   window is still open; the user should be able to re-open the assistant.
+//   Fix: removeTriggers() call removed from the Discard handler entirely.
+//   removeTriggers() is now called ONLY from the cleanup poller when the
+//   compose dialog is no longer in the DOM.
 //
-// FIX 2 — Triggers disappear after Insert:
-//   After a successful Insert, closePopup() + removeTriggers() were both
-//   called, removing the badge and toolbar button. The user had no way to
-//   re-open the assistant to check something else or insert again.
-//
-//   Fix: insertDraftAtTop() on success now calls closePopup() only — it does
-//   NOT call removeTriggers(). The badge and toolbar button remain visible.
-//   The user can click either one to open a fresh assistant panel.
-//   removeTriggers() is still called when the compose dialog closes (clean
-//   up) and when the user explicitly Discards from the minibar.
-//
-// All fixes from v1.19 retained:
-//   - Rolling 5-second grace period (snapshot ticks)
-//   - isComposeDialog() uses editable iframe as primary check
-//   - getEditorIframe() checks designMode === 'on'
-//   - insertDraftAtTop() uses insertAdjacentHTML('afterbegin')
-//   - e.stopPropagation() on Cancel, Minimize, Insert, thumbs
-//   - Discard from minibar clears seenDialogs[dialogEl.id]
+// All v1.20 fixes retained.
 
 (function () {
   'use strict';
@@ -56,7 +39,7 @@
   var escListener  = null;
 
   var pollTickCount  = 0;
-  var SNAPSHOT_TICKS = 10; // 10 x 500ms = 5-second grace period
+  var SNAPSHOT_TICKS = 10;
 
   // ── FRAME HELPERS ─────────────────────────────────────────────────────────────
   function getAppFrame() {
@@ -105,10 +88,6 @@
   }
 
   // ── IS COMPOSE DIALOG? ────────────────────────────────────────────────────────
-  // PRIMARY check: does this dialog contain an iframe whose body is editable?
-  // Both viewer and compose dialogs have .x-html-editor-tb, so toolbar classes
-  // cannot distinguish them. Only the compose dialog's iframe has
-  // isContentEditable === true (because ExtJS sets designMode = 'on' on it).
   function isComposeDialog(dialogEl) {
     var iframes = dialogEl.querySelectorAll('iframe');
     for (var k = 0; k < iframes.length; k++) {
@@ -120,7 +99,6 @@
         }
       } catch (e) {}
     }
-    // Fallback: if iframes haven't rendered yet, use toolbar class hint
     if (iframes.length === 0) {
       if (dialogEl.querySelector('.x-html-editor-tb, .x-html-editor-wrap')) {
         return true;
@@ -308,10 +286,24 @@
     document.head.appendChild(style);
   }
 
+  // ── BADGE VISIBILITY HELPERS ──────────────────────────────────────────────────
+  // The badge is hidden while the panel is open (so it doesn't layer on top),
+  // and restored whenever the panel closes for any reason other than dialog close.
+  // Dialog close calls removeTriggers() which removes the badge from the DOM.
+  function hideBadge() {
+    var badge = document.getElementById('uwm-ra-badge');
+    if (badge) badge.style.display = 'none';
+  }
+
+  function restoreBadge() {
+    var badge = document.getElementById('uwm-ra-badge');
+    if (badge) badge.style.display = '';
+  }
+
   // ── REMOVE TRIGGERS ───────────────────────────────────────────────────────────
-  // Only called when the compose dialog closes or user explicitly Discards.
-  // NOT called after a successful Insert — triggers stay visible so the user
-  // can open the assistant again to add more or check something else.
+  // ONLY called when the Neurons compose dialog closes (cleanup poller).
+  // Never called after Insert, Cancel, or Discard — the compose window is still
+  // open in those cases and the user should be able to re-open the assistant.
   function removeTriggers() {
     var innerDoc = getInnerDoc();
     if (innerDoc) {
@@ -322,7 +314,7 @@
     if (badge) badge.remove();
   }
 
-  // ── INJECT TOOLBAR BUTTON INTO COMPOSE DIALOG ─────────────────────────────────
+  // ── INJECT TOOLBAR BUTTON ─────────────────────────────────────────────────────
   function injectToolbarButton(dialogEl, innerDoc, onClickFn) {
     if (innerDoc.getElementById('uwm-ra-trigger-btn')) return;
 
@@ -379,10 +371,9 @@
   function minimizePopup() {
     var overlay = document.getElementById('uwm-ra-overlay');
     var minibar = document.getElementById('uwm-ra-minibar');
-    var badge   = document.getElementById('uwm-ra-badge');
     if (overlay) overlay.classList.add('ra-hidden');
     if (minibar) minibar.classList.remove('ra-hidden');
-    if (badge)   badge.style.display = 'none';
+    hideBadge(); // badge hidden while minibar is showing (cleaner UI)
     isMinimized = true;
     console.log(LOG, 'Pop-up minimized');
   }
@@ -390,10 +381,10 @@
   function restorePopup() {
     var overlay = document.getElementById('uwm-ra-overlay');
     var minibar = document.getElementById('uwm-ra-minibar');
-    var badge   = document.getElementById('uwm-ra-badge');
     if (overlay) overlay.classList.remove('ra-hidden');
     if (minibar) minibar.classList.add('ra-hidden');
-    if (badge)   badge.style.display = '';
+    // Badge stays hidden while the full panel is visible (it layers on top)
+    hideBadge();
     isMinimized = false;
     var editor = document.getElementById('uwm-ra-editor');
     if (editor) editor.focus();
@@ -413,6 +404,9 @@
       document.removeEventListener('keydown', escListener);
       escListener = null;
     }
+    // Restore badge visibility — compose dialog is still open, user may want
+    // to re-open the assistant. Badge was hidden while panel was showing.
+    restoreBadge();
     console.log(LOG, 'Pop-up closed');
   }
 
@@ -436,7 +430,7 @@
     });
     document.getElementById('uwm-ra-warn-confirm').addEventListener('click', function () {
       console.log(LOG, 'Draft discarded by user confirmation');
-      closePopup();
+      closePopup(); // closePopup() calls restoreBadge() — badge reappears
     });
     warn.addEventListener('click', function (e) { if (e.target === warn) warn.remove(); });
   }
@@ -461,8 +455,7 @@
     popupActive = true;
     injectStyles();
 
-    var badge = document.getElementById('uwm-ra-badge');
-    if (badge) badge.style.display = 'none';
+    hideBadge(); // hide while panel is open; closePopup() will restore it
 
     var overlay = document.createElement('div');
     overlay.id  = 'uwm-ra-overlay';
@@ -477,7 +470,7 @@
           '<span id="uwm-ra-searching"><span class="ra-spinner"></span>Searching knowledge base\u2026</span>' +
           '<div class="ra-header-actions">' +
             '<button id="uwm-ra-minimize-btn" title="Minimize \u2014 draft preserved">\u2013</button>' +
-            '<span class="ra-version">v1.20</span>' +
+            '<span class="ra-version">v1.21</span>' +
           '</div>' +
         '</div>' +
 
@@ -609,7 +602,6 @@
       minimizePopup();
     });
 
-    // INSERT — closes popup but does NOT remove triggers so user can re-open
     document.getElementById('uwm-ra-insert').addEventListener('click', function (e) {
       e.stopPropagation();
       var html = document.getElementById('uwm-ra-editor').innerHTML;
@@ -625,11 +617,9 @@
       }
       try {
         insertDraftAtTop(editorIframe, html);
-        closePopup();
-        // Intentionally NOT calling removeTriggers() here.
-        // The badge and toolbar button remain visible so the user can
-        // re-open the assistant to check something else or insert again.
-        console.log(LOG, 'Insert complete — triggers remain for re-use');
+        closePopup(); // restores badge via closePopup() → restoreBadge()
+        // Do NOT call removeTriggers() — compose dialog still open
+        console.log(LOG, 'Insert complete — badge and button remain for re-use');
       } catch (e2) {
         console.error(LOG, 'Insert failed:', e2);
         alert('[UWM Reply Assistant] Insert failed \u2014 see console. Error: ' + e2.message);
@@ -668,10 +658,13 @@
 
     document.getElementById('uwm-ra-mini-restore').addEventListener('click', restorePopup);
 
+    // Discard from minibar: close popup only — do NOT remove triggers.
+    // Badge is restored by closePopup() → restoreBadge().
+    // seenDialogs entry cleared so poller can re-inject if needed.
     document.getElementById('uwm-ra-mini-discard').addEventListener('click', function () {
       console.log(LOG, 'Draft discarded from minibar');
-      closePopup();
-      removeTriggers();
+      closePopup(); // restores badge
+      // No removeTriggers() call — compose dialog still open
       delete seenDialogs[dialogEl.id];
     });
 
@@ -684,9 +677,9 @@
     if (knownDialogIds[dialogEl.id]) return;
 
     if (!isComposeDialog(dialogEl)) {
-      // File it away immediately so the poller never evaluates it again (Fix 1)
+      // File it away — never evaluate this dialog again (stops console spam)
       knownDialogIds[dialogEl.id] = true;
-      console.log(LOG, 'Dialog ' + dialogEl.id + ' is not compose — added to known, will not re-check');
+      console.log(LOG, 'Dialog ' + dialogEl.id + ' is not compose — filed, will not re-check');
       return;
     }
 
@@ -710,9 +703,9 @@
         clearInterval(cleanPoller);
         cleanPoller = null;
         delete seenDialogs[dialogEl.id];
-        removeTriggers();
+        removeTriggers(); // compose dialog gone — now it's safe to remove badge + button
         if (popupActive) closePopup();
-        console.log(LOG, 'Compose dialog closed');
+        console.log(LOG, 'Compose dialog closed — triggers removed');
       }
     }, 800);
   }
@@ -728,7 +721,6 @@
       var dialogs = innerDoc.querySelectorAll('.x-frs-modal-form');
 
       if (pollTickCount <= SNAPSHOT_TICKS) {
-        // Grace period: absorb all current dialogs as known
         for (var s = 0; s < dialogs.length; s++) {
           if (!knownDialogIds[dialogs[s].id]) {
             knownDialogIds[dialogs[s].id] = true;
@@ -761,7 +753,7 @@
     }
     startObserver(innerDoc);
     startPoller();
-    console.log(LOG, 'v1.20 initialized — 5-second grace period active');
+    console.log(LOG, 'v1.21 initialized — 5-second grace period active');
   }
 
   if (document.readyState === 'loading') {
