@@ -1,30 +1,41 @@
 // ==UserScript==
 // @name         Neurons - Reply Assistant
 // @namespace    https://uwm-amc.ivanticloud.com/
-// @version      1.21
+// @version      1.22
 // @description  Detects reply/compose dialog, injects AI-assist pop-up with native contentEditable editor.
 // @match        https://uwm-amc.ivanticloud.com/*
 // @grant        none
 // @run-at       document-idle
 // ==/UserScript==
 
-// ── CHANGES IN v1.21 ─────────────────────────────────────────────────────────
+// ── CHANGES IN v1.22 ─────────────────────────────────────────────────────────
 //
-// FIX 1 — Badge disappears after Insert:
-//   showPopup() hides the badge with badge.style.display = 'none' while the
-//   panel is open. closePopup() was not restoring it. Fix: closePopup() now
-//   calls restoreBadge() which sets badge.style.display = '' so it reappears.
+// FIX 1 — Ordered / unordered list buttons did not work:
+//   execCmd() was calling document.execCommand() on the OUTER page document,
+//   which has no selection. Lists require execCommand on the contentEditable
+//   div's own document. Fixed: execCmd() now calls
+//   editor.ownerDocument.execCommand() so the command always runs on the
+//   correct document regardless of where focus is.
 //
-// FIX 2 — Badge and button disappear after Discard from minibar:
-//   The minibar Discard handler was calling removeTriggers() after closePopup().
-//   Triggers (badge + button) should only be removed when the Neurons compose
-//   dialog itself closes — not when the user discards a draft. The compose
-//   window is still open; the user should be able to re-open the assistant.
-//   Fix: removeTriggers() call removed from the Discard handler entirely.
-//   removeTriggers() is now called ONLY from the cleanup poller when the
-//   compose dialog is no longer in the DOM.
+// FIX 2 — Links open in same tab:
+//   createLink inserts a plain <a> with no target. After execCommand we find
+//   all <a> elements in the editor that are missing target="_blank" and add it.
+//   Also adds rel="noopener noreferrer" for security.
 //
-// All v1.20 fixes retained.
+// FIX 3 — "Clear" button tooltip / label:
+//   Renamed to "✕ Clear formatting" with title="Remove bold, italic, underline,
+//   and color from selected text" so purpose is obvious on hover.
+//
+// FIX 4 — Image drop button + popup (adapted from ImageDrop v1.6):
+//   Added an "🖼 Image" toolbar button. Clicking it opens a full-screen drop
+//   zone overlay (same design as ImageDrop). The user drops an image file; it
+//   is inserted as a base64 <img> at the current cursor position in the
+//   Reply Assistant editor (not the Neurons compose window). The image is
+//   included in the HTML when Insert into Email is clicked, exactly like any
+//   other content. No keyboard shortcut — button only, integrated into the
+//   existing toolbar flow.
+//
+// All v1.21 fixes retained.
 
 (function () {
   'use strict';
@@ -40,6 +51,12 @@
 
   var pollTickCount  = 0;
   var SNAPSHOT_TICKS = 10;
+
+  // Default width for images inserted via the drop popup
+  var IMG_DEFAULT_WIDTH = 300;
+
+  // Saved selection range for image insertion (cursor position before popup opens)
+  var savedImageRange = null;
 
   // ── FRAME HELPERS ─────────────────────────────────────────────────────────────
   function getAppFrame() {
@@ -127,10 +144,28 @@
   }
 
   // ── TOOLBAR execCommand HELPER ────────────────────────────────────────────────
+  // CRITICAL FIX: must call execCommand on editor.ownerDocument, not on
+  // `document` (the outer page). Using the outer document's execCommand operates
+  // on the outer page's selection (which is always empty), so list commands were
+  // silently no-ops. Bold/italic/underline happened to work because the browser
+  // still applied them in some environments, but lists never worked.
   function execCmd(cmd, value) {
     var editor = document.getElementById('uwm-ra-editor');
-    if (editor) editor.focus();
-    document.execCommand(cmd, false, value || null);
+    if (!editor) return;
+    editor.focus();
+    // Run the command on the div's own document so it targets the correct selection
+    editor.ownerDocument.execCommand(cmd, false, value || null);
+  }
+
+  // After inserting a link, ensure all <a> tags in the editor open in a new tab
+  function fixLinksNewTab() {
+    var editor = document.getElementById('uwm-ra-editor');
+    if (!editor) return;
+    var links = editor.querySelectorAll('a');
+    for (var i = 0; i < links.length; i++) {
+      links[i].target = '_blank';
+      links[i].rel    = 'noopener noreferrer';
+    }
   }
 
   // ── INJECT STYLES ─────────────────────────────────────────────────────────────
@@ -242,6 +277,7 @@
     css += '  cursor: text; pointer-events: all;';
     css += '}';
     css += '#uwm-ra-editor a { color: #1a5bb8; }';
+    css += '#uwm-ra-editor img { max-width: 100%; height: auto; display: block; margin: 6px 0; }';
 
     css += '#uwm-ra-footer { padding: 10px 16px; border-top: 1px solid #e2e5ec; display: flex; align-items: center; gap: 10px; background: #f7f8fa; flex-shrink: 0; }';
     css += '.ra-btn { padding: 7px 18px; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; border: none; transition: background 0.15s; pointer-events: all; }';
@@ -280,6 +316,33 @@
     css += '#uwm-ra-warn-confirm { background: #dc2626; color: #fff; }';
     css += '#uwm-ra-warn-confirm:hover { background: #b91c1c; }';
 
+    // ── Image drop popup styles ──
+    css += '#uwm-ra-imgdrop-overlay {';
+    css += '  position: fixed; inset: 0; z-index: 1000001;';
+    css += '  background: rgba(0,0,0,0.65);';
+    css += '  display: flex; align-items: center; justify-content: center;';
+    css += '  font-family: "Segoe UI", system-ui, sans-serif;';
+    css += '}';
+    css += '#uwm-ra-imgdrop-box {';
+    css += '  width: 420px; height: 280px;';
+    css += '  background: #fff; border-radius: 12px;';
+    css += '  border: 3px dashed #3a8fd8;';
+    css += '  display: flex; flex-direction: column;';
+    css += '  align-items: center; justify-content: center; gap: 12px;';
+    css += '  box-shadow: 0 8px 32px rgba(0,0,0,0.35);';
+    css += '  transition: background 0.15s, border-color 0.15s;';
+    css += '  cursor: default;';
+    css += '}';
+    css += '#uwm-ra-imgdrop-box.ra-drop-hover {';
+    css += '  background: #e8f4fd; border-color: #1a6fb5;';
+    css += '}';
+    css += '#uwm-ra-imgdrop-icon { font-size: 52px; line-height: 1; user-select: none; }';
+    css += '#uwm-ra-imgdrop-label { font-size: 20px; font-weight: 700; color: #222; user-select: none; }';
+    css += '#uwm-ra-imgdrop-sub { font-size: 13px; color: #666; user-select: none; }';
+    css += '#uwm-ra-imgdrop-cancel { margin-top: 6px; font-size: 12px; color: #999; cursor: pointer; text-decoration: underline; user-select: none; }';
+    css += '#uwm-ra-imgdrop-cancel:hover { color: #555; }';
+    css += '#uwm-ra-imgdrop-box.ra-drop-error { border-color: #c0392b; background: #fff0ee; }';
+
     var style = document.createElement('style');
     style.id          = 'uwm-ra-styles';
     style.textContent = css;
@@ -287,9 +350,6 @@
   }
 
   // ── BADGE VISIBILITY HELPERS ──────────────────────────────────────────────────
-  // The badge is hidden while the panel is open (so it doesn't layer on top),
-  // and restored whenever the panel closes for any reason other than dialog close.
-  // Dialog close calls removeTriggers() which removes the badge from the DOM.
   function hideBadge() {
     var badge = document.getElementById('uwm-ra-badge');
     if (badge) badge.style.display = 'none';
@@ -301,9 +361,7 @@
   }
 
   // ── REMOVE TRIGGERS ───────────────────────────────────────────────────────────
-  // ONLY called when the Neurons compose dialog closes (cleanup poller).
-  // Never called after Insert, Cancel, or Discard — the compose window is still
-  // open in those cases and the user should be able to re-open the assistant.
+  // ONLY called when the compose dialog closes. Never called on Insert/Cancel/Discard.
   function removeTriggers() {
     var innerDoc = getInnerDoc();
     if (innerDoc) {
@@ -373,7 +431,7 @@
     var minibar = document.getElementById('uwm-ra-minibar');
     if (overlay) overlay.classList.add('ra-hidden');
     if (minibar) minibar.classList.remove('ra-hidden');
-    hideBadge(); // badge hidden while minibar is showing (cleaner UI)
+    hideBadge();
     isMinimized = true;
     console.log(LOG, 'Pop-up minimized');
   }
@@ -383,7 +441,6 @@
     var minibar = document.getElementById('uwm-ra-minibar');
     if (overlay) overlay.classList.remove('ra-hidden');
     if (minibar) minibar.classList.add('ra-hidden');
-    // Badge stays hidden while the full panel is visible (it layers on top)
     hideBadge();
     isMinimized = false;
     var editor = document.getElementById('uwm-ra-editor');
@@ -395,17 +452,18 @@
     var overlay = document.getElementById('uwm-ra-overlay');
     var minibar = document.getElementById('uwm-ra-minibar');
     var warn    = document.getElementById('uwm-ra-warn-overlay');
+    var imgDrop = document.getElementById('uwm-ra-imgdrop-overlay');
     if (overlay) overlay.remove();
     if (minibar) minibar.remove();
     if (warn)    warn.remove();
+    if (imgDrop) imgDrop.remove();
     popupActive = false;
     isMinimized = false;
+    savedImageRange = null;
     if (escListener) {
       document.removeEventListener('keydown', escListener);
       escListener = null;
     }
-    // Restore badge visibility — compose dialog is still open, user may want
-    // to re-open the assistant. Badge was hidden while panel was showing.
     restoreBadge();
     console.log(LOG, 'Pop-up closed');
   }
@@ -430,12 +488,208 @@
     });
     document.getElementById('uwm-ra-warn-confirm').addEventListener('click', function () {
       console.log(LOG, 'Draft discarded by user confirmation');
-      closePopup(); // closePopup() calls restoreBadge() — badge reappears
+      closePopup();
     });
     warn.addEventListener('click', function (e) { if (e.target === warn) warn.remove(); });
   }
 
-  // ── INSERT DRAFT AT TOP ───────────────────────────────────────────────────────
+  // ── IMAGE DROP POPUP ──────────────────────────────────────────────────────────
+  // Opens a full-screen drop zone. On successful drop, inserts the image as a
+  // base64 <img> at the saved cursor position in the Reply Assistant editor.
+  // The image travels with the HTML when Insert into Email is clicked.
+  function showImageDropPopup() {
+    if (document.getElementById('uwm-ra-imgdrop-overlay')) return;
+
+    // Save the current cursor position in the RA editor before opening overlay
+    var editor = document.getElementById('uwm-ra-editor');
+    if (editor) {
+      var sel = editor.ownerDocument.getSelection();
+      if (sel && sel.rangeCount > 0) {
+        savedImageRange = sel.getRangeAt(0).cloneRange();
+      } else {
+        // Default to end of editor content
+        savedImageRange = editor.ownerDocument.createRange();
+        savedImageRange.selectNodeContents(editor);
+        savedImageRange.collapse(false);
+      }
+    }
+
+    var overlay = document.createElement('div');
+    overlay.id  = 'uwm-ra-imgdrop-overlay';
+
+    var box = document.createElement('div');
+    box.id  = 'uwm-ra-imgdrop-box';
+
+    var icon = document.createElement('div');
+    icon.id          = 'uwm-ra-imgdrop-icon';
+    icon.textContent = '\uD83D\uDDBC'; // 🖼
+
+    var label = document.createElement('div');
+    label.id          = 'uwm-ra-imgdrop-label';
+    label.textContent = 'Drop image here';
+
+    var sub = document.createElement('div');
+    sub.id          = 'uwm-ra-imgdrop-sub';
+    sub.textContent = 'PNG, JPG, GIF, WEBP — releases instantly on drop';
+
+    var cancelBtn = document.createElement('div');
+    cancelBtn.id          = 'uwm-ra-imgdrop-cancel';
+    cancelBtn.textContent = 'Cancel (Esc)';
+    cancelBtn.addEventListener('click', closeImageDropPopup);
+
+    box.appendChild(icon);
+    box.appendChild(label);
+    box.appendChild(sub);
+    box.appendChild(cancelBtn);
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+
+    // Close on backdrop click
+    overlay.addEventListener('click', function (e) {
+      if (e.target === overlay) closeImageDropPopup();
+    });
+
+    // Drag visual feedback
+    box.addEventListener('dragenter', function (e) {
+      e.preventDefault();
+      box.classList.add('ra-drop-hover');
+    });
+    box.addEventListener('dragover', function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      e.dataTransfer.dropEffect = 'copy';
+    });
+    box.addEventListener('dragleave', function (e) {
+      if (!box.contains(e.relatedTarget)) {
+        box.classList.remove('ra-drop-hover');
+      }
+    });
+    box.addEventListener('drop', handleImageDrop);
+
+    // ESC closes image drop popup (but keeps RA panel open)
+    document.addEventListener('keydown', imgDropEscHandler, true);
+
+    console.log(LOG, 'Image drop popup opened');
+  }
+
+  function closeImageDropPopup() {
+    var overlay = document.getElementById('uwm-ra-imgdrop-overlay');
+    if (overlay) overlay.remove();
+    document.removeEventListener('keydown', imgDropEscHandler, true);
+    // Restore focus to the RA editor
+    var editor = document.getElementById('uwm-ra-editor');
+    if (editor) editor.focus();
+    console.log(LOG, 'Image drop popup closed');
+  }
+
+  function imgDropEscHandler(e) {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      closeImageDropPopup();
+    }
+  }
+
+  function handleImageDrop(e) {
+    e.preventDefault();
+    e.stopPropagation();
+
+    var files = [];
+    for (var i = 0; i < e.dataTransfer.files.length; i++) {
+      if (e.dataTransfer.files[i].type.indexOf('image/') === 0) {
+        files.push(e.dataTransfer.files[i]);
+      }
+    }
+
+    if (files.length === 0) {
+      showImageDropError('No image found. Please drop a PNG, JPG, GIF, or WEBP file.');
+      return;
+    }
+
+    var file   = files[0];
+    var reader = new FileReader();
+    reader.onload = function (ev) {
+      closeImageDropPopup();
+      insertImageInEditor(ev.target.result, file.name);
+    };
+    reader.onerror = function () {
+      showImageDropError('Could not read the file. Please try again.');
+    };
+    reader.readAsDataURL(file);
+  }
+
+  function showImageDropError(msg) {
+    var box   = document.getElementById('uwm-ra-imgdrop-box');
+    var label = document.getElementById('uwm-ra-imgdrop-label');
+    var sub   = document.getElementById('uwm-ra-imgdrop-sub');
+    if (!box) return;
+    box.classList.add('ra-drop-error');
+    if (label) { label.textContent = 'Error'; label.style.color = '#c0392b'; }
+    if (sub)   { sub.textContent   = msg; }
+  }
+
+  // Insert a base64 image into the RA contentEditable editor at the saved cursor
+  function insertImageInEditor(dataUrl, filename) {
+    var editor = document.getElementById('uwm-ra-editor');
+    if (!editor) {
+      console.warn(LOG, 'insertImageInEditor: editor not found');
+      return;
+    }
+
+    var editorDoc = editor.ownerDocument;
+    editor.focus();
+
+    // Restore the saved cursor position (from before the drop popup opened)
+    if (savedImageRange) {
+      var sel = editorDoc.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(savedImageRange);
+      savedImageRange = null;
+    }
+
+    try {
+      var safeName     = (filename || 'image').replace(/"/g, '&quot;');
+      var uniqueMarker = 'ra-img-' + Date.now();
+      var imgHTML = '<img src="' + dataUrl + '"'
+        + ' alt="' + uniqueMarker + '"'
+        + ' style="width:' + IMG_DEFAULT_WIDTH + 'px;height:auto;max-width:100%;display:block;margin:6px 0;">';
+
+      var ok = editorDoc.execCommand('insertHTML', false, imgHTML);
+
+      if (!ok) {
+        // Fallback: manual DOM insertion
+        var img = editorDoc.createElement('img');
+        img.src       = dataUrl;
+        img.alt       = uniqueMarker;
+        img.style.cssText = 'width:' + IMG_DEFAULT_WIDTH + 'px;height:auto;max-width:100%;display:block;margin:6px 0;';
+        var sel2  = editorDoc.getSelection();
+        var range = sel2 && sel2.rangeCount > 0 ? sel2.getRangeAt(0) : null;
+        if (range) {
+          range.deleteContents();
+          range.insertNode(img);
+          var after = editorDoc.createRange();
+          after.setStartAfter(img);
+          after.collapse(true);
+          sel2.removeAllRanges();
+          sel2.addRange(after);
+        } else {
+          editor.appendChild(img);
+        }
+      }
+
+      // Clean up the temp marker alt tag
+      setTimeout(function () {
+        var inserted = editor.querySelector('img[alt="' + uniqueMarker + '"]');
+        if (inserted) inserted.alt = safeName;
+      }, 50);
+
+      console.log(LOG, 'Image inserted into RA editor (' + filename + ')');
+    } catch (err) {
+      console.error(LOG, 'Image insert failed:', err);
+    }
+  }
+
+  // ── INSERT DRAFT INTO NEURONS COMPOSE ────────────────────────────────────────
   function insertDraftAtTop(editorIframe, draftHtml) {
     var editorBody = editorIframe.contentDocument.body;
     var editorDoc  = editorIframe.contentDocument;
@@ -455,7 +709,7 @@
     popupActive = true;
     injectStyles();
 
-    hideBadge(); // hide while panel is open; closePopup() will restore it
+    hideBadge();
 
     var overlay = document.createElement('div');
     overlay.id  = 'uwm-ra-overlay';
@@ -470,7 +724,7 @@
           '<span id="uwm-ra-searching"><span class="ra-spinner"></span>Searching knowledge base\u2026</span>' +
           '<div class="ra-header-actions">' +
             '<button id="uwm-ra-minimize-btn" title="Minimize \u2014 draft preserved">\u2013</button>' +
-            '<span class="ra-version">v1.21</span>' +
+            '<span class="ra-version">v1.22</span>' +
           '</div>' +
         '</div>' +
 
@@ -522,16 +776,17 @@
 
           '<div id="uwm-ra-editor-area">' +
             '<div id="uwm-ra-toolbar">' +
-              '<button class="ra-tb-btn" data-cmd="bold"                title="Bold"><b>B</b></button>' +
-              '<button class="ra-tb-btn" data-cmd="italic"              title="Italic"><i>I</i></button>' +
-              '<button class="ra-tb-btn" data-cmd="underline"           title="Underline"><u>U</u></button>' +
+              '<button class="ra-tb-btn" data-cmd="bold"      title="Bold (Ctrl+B)"><b>B</b></button>' +
+              '<button class="ra-tb-btn" data-cmd="italic"    title="Italic (Ctrl+I)"><i>I</i></button>' +
+              '<button class="ra-tb-btn" data-cmd="underline" title="Underline (Ctrl+U)"><u>U</u></button>' +
               '<div class="ra-tb-sep"></div>' +
-              '<button class="ra-tb-btn" data-cmd="insertUnorderedList" title="Bullet list">&#8226; List</button>' +
+              '<button class="ra-tb-btn" data-cmd="insertUnorderedList" title="Bullet list">\u2022 List</button>' +
               '<button class="ra-tb-btn" data-cmd="insertOrderedList"   title="Numbered list">1. List</button>' +
               '<div class="ra-tb-sep"></div>' +
-              '<button class="ra-tb-btn" id="uwm-ra-link-btn"           title="Insert link">&#128279; Link</button>' +
+              '<button class="ra-tb-btn" id="uwm-ra-link-btn"  title="Insert hyperlink (opens in new tab)">\uD83D\uDD17 Link</button>' +
+              '<button class="ra-tb-btn" id="uwm-ra-image-btn" title="Insert image (drop PNG, JPG, GIF, WEBP)">\uD83D\uDDBC\uFE0F Image</button>' +
               '<div class="ra-tb-sep"></div>' +
-              '<button class="ra-tb-btn" data-cmd="removeFormat"        title="Clear formatting">&#10005; Clear</button>' +
+              '<button class="ra-tb-btn" data-cmd="removeFormat" title="Remove bold, italic, underline, and color from selected text">\u2715 Clear formatting</button>' +
             '</div>' +
             '<div id="uwm-ra-editor" contenteditable="true" spellcheck="true"></div>' +
           '</div>' +
@@ -568,8 +823,8 @@
       '<p><em>Placeholder draft \u2014 will be replaced with a real AI-generated reply once search and Ollama integration are complete.</em></p>' +
       '<p>Based on what you\u2019ve described, here are some resources that may help:</p>' +
       '<ul>' +
-        '<li>UWM Knowledge Base: <a href="https://kb.uwm.edu">Setting Up Your Canvas Course Site</a></li>' +
-        '<li>Canvas Community: <a href="https://community.instructure.com">How do I add files to a course?</a></li>' +
+        '<li>UWM Knowledge Base: <a href="https://kb.uwm.edu" target="_blank" rel="noopener noreferrer">Setting Up Your Canvas Course Site</a></li>' +
+        '<li>Canvas Community: <a href="https://community.instructure.com" target="_blank" rel="noopener noreferrer">How do I add files to a course?</a></li>' +
       '</ul>' +
       '<p>Please let me know if you have any questions or if this doesn\u2019t resolve the issue \u2014 happy to help further.</p>' +
       '<p>Best,<br>Lane<br>CETL Teaching, Learning &amp; Technology Consultant</p>';
@@ -581,27 +836,42 @@
       if (el) el.innerHTML = '<span style="color:#4ade80;font-size:12px;">&#10003; Search complete</span>';
     }, 2000);
 
-    // Toolbar
+    // ── Toolbar: standard execCommand buttons ──
     var tbBtns = document.querySelectorAll('#uwm-ra-toolbar .ra-tb-btn[data-cmd]');
     for (var t = 0; t < tbBtns.length; t++) {
       (function (btn) {
         btn.addEventListener('mousedown', function (e) {
+          // preventDefault keeps focus in the editor so selection is preserved
           e.preventDefault();
           execCmd(btn.getAttribute('data-cmd'));
         });
       }(tbBtns[t]));
     }
+
+    // ── Link button: prompt for URL, insert link, force new tab ──
     document.getElementById('uwm-ra-link-btn').addEventListener('mousedown', function (e) {
       e.preventDefault();
-      var url = prompt('Enter URL:', 'https://');
-      if (url && url !== 'https://') execCmd('createLink', url);
+      var url = prompt('Enter URL (will open in a new tab):', 'https://');
+      if (url && url !== 'https://') {
+        execCmd('createLink', url);
+        // After inserting, ensure all links in the editor open in a new tab
+        fixLinksNewTab();
+      }
     });
 
+    // ── Image button: save cursor position, open drop popup ──
+    document.getElementById('uwm-ra-image-btn').addEventListener('mousedown', function (e) {
+      e.preventDefault(); // keeps cursor position
+      showImageDropPopup();
+    });
+
+    // ── Minimize ──
     document.getElementById('uwm-ra-minimize-btn').addEventListener('click', function (e) {
       e.stopPropagation();
       minimizePopup();
     });
 
+    // ── Insert into Email ──
     document.getElementById('uwm-ra-insert').addEventListener('click', function (e) {
       e.stopPropagation();
       var html = document.getElementById('uwm-ra-editor').innerHTML;
@@ -617,8 +887,7 @@
       }
       try {
         insertDraftAtTop(editorIframe, html);
-        closePopup(); // restores badge via closePopup() → restoreBadge()
-        // Do NOT call removeTriggers() — compose dialog still open
+        closePopup();
         console.log(LOG, 'Insert complete — badge and button remain for re-use');
       } catch (e2) {
         console.error(LOG, 'Insert failed:', e2);
@@ -626,11 +895,13 @@
       }
     });
 
+    // ── Cancel ──
     document.getElementById('uwm-ra-cancel').addEventListener('click', function (e) {
       e.stopPropagation();
       showCancelWarning();
     });
 
+    // ── Thumbs ──
     document.getElementById('uwm-ra-thumb-up').addEventListener('click', function (e) {
       e.stopPropagation();
       this.classList.toggle('ra-thumb-selected');
@@ -644,27 +915,28 @@
       console.log(LOG, 'Thumbs down');
     });
 
+    // ── Backdrop click → minimize ──
     overlay.addEventListener('click', function (e) {
       if (e.target === overlay) minimizePopup();
     });
 
+    // ── ESC key: minimize/restore RA panel; close image drop if open ──
     escListener = function (e) {
       if (e.key === 'Escape' || e.keyCode === 27) {
+        // If image drop popup is open, ESC closes that first (handled by its own listener)
+        if (document.getElementById('uwm-ra-imgdrop-overlay')) return;
         if (!popupActive) return;
         if (isMinimized) { restorePopup(); } else { minimizePopup(); }
       }
     };
     document.addEventListener('keydown', escListener);
 
+    // ── Minibar restore / discard ──
     document.getElementById('uwm-ra-mini-restore').addEventListener('click', restorePopup);
 
-    // Discard from minibar: close popup only — do NOT remove triggers.
-    // Badge is restored by closePopup() → restoreBadge().
-    // seenDialogs entry cleared so poller can re-inject if needed.
     document.getElementById('uwm-ra-mini-discard').addEventListener('click', function () {
       console.log(LOG, 'Draft discarded from minibar');
-      closePopup(); // restores badge
-      // No removeTriggers() call — compose dialog still open
+      closePopup();
       delete seenDialogs[dialogEl.id];
     });
 
@@ -677,7 +949,6 @@
     if (knownDialogIds[dialogEl.id]) return;
 
     if (!isComposeDialog(dialogEl)) {
-      // File it away — never evaluate this dialog again (stops console spam)
       knownDialogIds[dialogEl.id] = true;
       console.log(LOG, 'Dialog ' + dialogEl.id + ' is not compose — filed, will not re-check');
       return;
@@ -703,7 +974,7 @@
         clearInterval(cleanPoller);
         cleanPoller = null;
         delete seenDialogs[dialogEl.id];
-        removeTriggers(); // compose dialog gone — now it's safe to remove badge + button
+        removeTriggers();
         if (popupActive) closePopup();
         console.log(LOG, 'Compose dialog closed — triggers removed');
       }
@@ -753,7 +1024,7 @@
     }
     startObserver(innerDoc);
     startPoller();
-    console.log(LOG, 'v1.21 initialized — 5-second grace period active');
+    console.log(LOG, 'v1.22 initialized — 5-second grace period active');
   }
 
   if (document.readyState === 'loading') {
