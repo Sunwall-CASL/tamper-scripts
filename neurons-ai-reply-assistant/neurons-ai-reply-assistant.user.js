@@ -10,32 +10,42 @@
 // ── CHANGES IN v1.18 ─────────────────────────────────────────────────────────
 //
 // BUG 1 FIXED — Triggers appearing before Reply is clicked (snapshot timing):
-//   Root cause: init() runs ~1s after page load, but the email viewer modal is
-//   lazy-loaded by Neurons AFTER that 1s mark. Snapshot found 0 dialogs, so
-//   when the viewer appeared the poller treated it as a new compose dialog.
+//   Diagnosed via console: 1 pre-existing dialog exists before Reply is clicked
+//   (the "Edit Email" viewer, id=ext-comp-2279), but init() runs ~1s after page
+//   load and Neurons lazy-renders the viewer AFTER that — so snapshot always
+//   finds 0 dialogs. When the viewer appears, the poller treats it as a new
+//   compose dialog.
 //   Fix: Rolling re-snapshot for the first 10 poller ticks (5 seconds). During
 //   this grace period every dialog found is added to knownDialogIds instead of
-//   being passed to handleDialog(). After tick 10, normal handleDialog() runs.
+//   being passed to handleDialog(). After tick 10, normal mode resumes.
 //
-// BUG 2 FIXED — Corollary of Bug 1. Resolves automatically once Bug 1 is fixed.
+// BUG 2 FIXED — AI Assistant button disappears when Reply is clicked:
+//   Corollary of Bug 1. Resolves automatically once Bug 1 is fixed.
 //
 // BUG 3 FIXED — Insert button does nothing:
-//   Primary fix: resolved by Bug 1 fix (triggers now go on compose dialog).
-//   Additional hardening in getEditorIframe(): also checks
-//     fr.contentDocument.designMode === 'on'
-//   as a secondary detection path (ExtJS uses designMode, not contenteditable attr).
+//   Diagnosed: both dialogs have .x-html-editor-tb, so isComposeDialog() returned
+//   true for the viewer. getEditorIframe() was called on the viewer's dialog,
+//   found isContentEditable=false on its iframe, used fallback (viewer iframe),
+//   and insertDraftAtTop failed (designMode=off on viewer).
+//   Primary fix: Bug 1 fix routes triggers to the correct compose dialog.
+//   isComposeDialog() now uses iframe editability as its PRIMARY check (not just
+//   toolbar classes), since BOTH dialogs have .x-html-editor-tb.
+//   getEditorIframe() also checks fr.contentDocument.designMode === 'on' as a
+//   secondary path (ExtJS uses designMode=on, not contenteditable attr).
 //   insertDraftAtTop() now uses insertAdjacentHTML('afterbegin') instead of the
-//   manual node-prepend loop to avoid node-adoption edge cases.
-//   isComposeDialog() PRIMARY check is now iframe editability (isContentEditable
-//   or designMode=on), since BOTH viewer and compose dialogs have .x-html-editor-tb.
+//   manual node-prepend loop to avoid node-adoption issues.
 //
 // BUG 4 FIXED — Cancel and Minimize buttons non-functional:
-//   Added e.stopPropagation() to Cancel and Minimize button click handlers.
-//   Added pointer-events: all to #uwm-ra-panel and all button elements in CSS.
+//   Added e.stopPropagation() to the Cancel and Minimize button click handlers
+//   so the overlay's own click handler (which calls minimizePopup on backdrop
+//   clicks) cannot swallow them.
+//   Added pointer-events: all to #uwm-ra-panel, .ra-btn, .ra-tb-btn,
+//   .ra-thumb-btn, .ra-mini-btn, and #uwm-ra-minimize-btn in CSS.
 //
-// BUG 5 FIXED — After Discard from minibar, AI Assistant access is gone:
-//   In the minibar Discard handler, delete seenDialogs[dialogEl.id] after
-//   closePopup() + removeTriggers(), so the poller re-processes the dialog.
+// BUG 5 FIXED — After Discard from minibar, AI Assistant access gone forever:
+//   After closePopup() + removeTriggers() in the minibar Discard handler,
+//   also delete seenDialogs[dialogEl.id] so the poller re-processes the
+//   (still-open) compose dialog and re-injects triggers.
 (function () {
   'use strict';
   var LOG          = '[UWM Reply Assistant]';
@@ -47,6 +57,8 @@
   var isMinimized  = false;
   var escListener  = null;
   // ── FRAME HELPERS ─────────────────────────────────────────────────────────────
+  // Three iframe.x-managed-iframe elements exist. The correct app frame is always
+  // the one with the largest offsetWidth. Never select by index.
   function getAppFrame() {
     var frames = document.querySelectorAll('iframe.x-managed-iframe');
     var best = null, bestWidth = 0;
@@ -60,18 +72,20 @@
     }
     return best;
   }
+  // Must be called fresh on every interval — never cache this reference.
   function getInnerDoc() {
     var f = getAppFrame();
     return f ? f.contentDocument : null;
   }
   // ── ROLLING SNAPSHOT (Bug 1 fix) ─────────────────────────────────────────────
-  // pollTickCount tracks how many poller ticks have fired. For the first
-  // SNAPSHOT_TICKS ticks, every dialog found is added to knownDialogIds (grace
-  // period). After that, normal handleDialog() behaviour resumes. This gives
-  // Neurons time to fully render the email viewer modal before we start watching
-  // for new compose dialogs.
-  var pollTickCount   = 0;
-  var SNAPSHOT_TICKS  = 10; // 10 × 500 ms = 5 seconds
+  // pollTickCount tracks how many poller ticks have fired.
+  // For the first SNAPSHOT_TICKS ticks, every dialog found is added to
+  // knownDialogIds (grace period — no triggers injected yet).
+  // After SNAPSHOT_TICKS ticks, normal handleDialog() behaviour resumes.
+  // This ensures Neurons has time to fully render the email viewer modal before
+  // we start watching for new compose dialogs.
+  var pollTickCount  = 0;
+  var SNAPSHOT_TICKS = 10; // 10 × 500 ms = 5 seconds grace period
   function takeSnapshot() {
     var innerDoc = getInnerDoc();
     if (!innerDoc) return;
@@ -84,7 +98,8 @@
       }
     }
     if (added > 0) {
-      console.log(LOG, 'Snapshot — added ' + added + ' dialog(s) to knownDialogIds (total known: ' + Object.keys(knownDialogIds).length + ')');
+      console.log(LOG, 'Snapshot tick ' + pollTickCount + ' — added ' + added +
+        ' dialog(s) to knownDialogIds (total known: ' + Object.keys(knownDialogIds).length + ')');
     }
   }
   // ── EMAIL THREAD READER ───────────────────────────────────────────────────────
@@ -114,9 +129,9 @@
   }
   // ── FIND COMPOSE EDITOR IFRAME (Bug 3 hardening) ──────────────────────────────
   // Primary check: body.isContentEditable === true (boolean).
-  // Secondary check: fr.contentDocument.designMode === 'on' (ExtJS uses designMode).
-  // Both viewer and compose have .x-html-editor-tb, so iframe editability is
-  // the only reliable distinguisher.
+  // Secondary check: fr.contentDocument.designMode === 'on'
+  //   (ExtJS uses designMode, not a contenteditable attribute on the body —
+  //   body.contentEditable is 'inherit', not 'true', so string checks fail).
   function getEditorIframe(dialogEl) {
     var iframes  = dialogEl.querySelectorAll('iframe');
     var fallback = null;
@@ -127,37 +142,41 @@
         if (doc.body.isContentEditable || doc.designMode === 'on') {
           console.log(LOG, 'getEditorIframe: editable iframe at index ' + i +
             ' (isContentEditable=' + doc.body.isContentEditable +
-            ' designMode=' + doc.designMode + ')');
+            ', designMode=' + doc.designMode + ')');
           return iframes[i];
         }
         if (!fallback) fallback = iframes[i];
       } catch (e) {}
     }
-    if (fallback) console.log(LOG, 'getEditorIframe: fallback iframe used — compose dialog may not be editable yet');
+    if (fallback) {
+      console.log(LOG, 'getEditorIframe: fallback iframe used — compose dialog may not be editable yet');
+    }
     return fallback;
   }
   // ── IS COMPOSE DIALOG? (Bug 3 — primary check rewritten) ─────────────────────
   // PRIMARY: Does this dialog contain an iframe whose body is editable?
-  // This is the only reliable check because BOTH viewer and compose have
-  // .x-html-editor-tb / .x-html-editor-wrap in this version of Neurons.
-  // SECONDARY: fall back to RTF toolbar check only if no iframes are present.
+  //   Diagnostic confirmed: both viewer (ext-comp-2279) and compose (ext-comp-2493)
+  //   have .x-html-editor-tb AND .x-html-editor-wrap. Toolbar checks alone cannot
+  //   distinguish them. Iframe editability is the only reliable signal.
+  // SECONDARY: RTF toolbar check is kept only as a fallback for the rare case
+  //   where the iframe hasn't loaded yet (no iframes found at all).
   function isComposeDialog(dialogEl) {
-    // Primary: check for an editable iframe
+    // Primary: check for an editable iframe (designMode=on or isContentEditable)
     var iframes = dialogEl.querySelectorAll('iframe');
     for (var k = 0; k < iframes.length; k++) {
       try {
         var iDoc = iframes[k].contentDocument;
         if (iDoc && iDoc.body && (iDoc.body.isContentEditable || iDoc.designMode === 'on')) {
-          console.log(LOG, 'isComposeDialog: editable iframe found at index ' + k + ' — is compose');
+          console.log(LOG, 'isComposeDialog: editable iframe found (index ' + k +
+            ', designMode=' + iDoc.designMode + ') — is compose');
           return true;
         }
       } catch (e) {}
     }
-    // Secondary: RTF toolbar markers (kept as fallback for edge cases where
-    // the iframe hasn't finished loading but the toolbar is already rendered)
+    // Secondary: RTF toolbar markers — only used when no iframes are present yet
     if (iframes.length === 0) {
       if (dialogEl.querySelector('.x-html-editor-tb, .x-html-editor-wrap, [class*="html-editor"]')) {
-        console.log(LOG, 'isComposeDialog: html-editor class found (no iframes yet) — is compose');
+        console.log(LOG, 'isComposeDialog: html-editor class found (no iframes present) — is compose');
         return true;
       }
       var allBtns = dialogEl.querySelectorAll('button, .x-btn-text, td.x-btn-mc');
@@ -171,8 +190,16 @@
           return true;
         }
       }
+      var imgs = dialogEl.querySelectorAll('img[alt], img[title]');
+      for (var j = 0; j < imgs.length; j++) {
+        var alt = ((imgs[j].alt || imgs[j].title) || '').toLowerCase();
+        if (alt === 'bold' || alt === 'italic' || alt === 'underline') {
+          console.log(LOG, 'isComposeDialog: bold/italic img found (no iframes) — is compose');
+          return true;
+        }
+      }
     }
-    console.log(LOG, 'isComposeDialog: no editable iframe found — treating as viewer');
+    console.log(LOG, 'isComposeDialog: no editable iframe — treating as viewer');
     return false;
   }
   // ── TOOLBAR execCommand HELPER ────────────────────────────────────────────────
@@ -228,7 +255,8 @@
       '  font-family: "Segoe UI", system-ui, sans-serif;',
       '}',
       '#uwm-ra-overlay.ra-hidden { display: none; }',
-      /* Bug 4 fix: pointer-events: all on panel so overlay click-through can't swallow button clicks */
+      /* Bug 4: pointer-events: all on panel prevents overlay backdrop from
+         swallowing clicks on buttons inside the panel */
       '#uwm-ra-panel {',
       '  width: 920px; max-width: 96vw; height: 640px; max-height: 92vh;',
       '  background: #f7f8fa; border-radius: 10px;',
@@ -433,16 +461,19 @@
       '</div>'
     ].join('');
     document.body.appendChild(warn);
-    document.getElementById('uwm-ra-warn-keep').addEventListener('click', function () { warn.remove(); });
+    document.getElementById('uwm-ra-warn-keep').addEventListener('click', function () {
+      warn.remove();
+    });
     document.getElementById('uwm-ra-warn-confirm').addEventListener('click', function () {
       console.log(LOG, 'Draft discarded by user confirmation');
       closePopup();
     });
     warn.addEventListener('click', function (e) { if (e.target === warn) warn.remove(); });
   }
-  // ── INSERT DRAFT AT TOP (Bug 3 fix — use insertAdjacentHTML) ─────────────────
-  // Uses insertAdjacentHTML('afterbegin') instead of manual node-prepend to avoid
-  // node-adoption edge cases with ExtJS's designMode iframe.
+  // ── INSERT DRAFT AT TOP (Bug 3 fix) ───────────────────────────────────────────
+  // Uses insertAdjacentHTML('afterbegin') instead of the manual node-prepend loop.
+  // Avoids node-adoption issues with ExtJS's designMode iframe; the browser's
+  // HTML parser handles the insertion natively and correctly.
   function insertDraftAtTop(editorIframe, draftHtml) {
     var editorBody = editorIframe.contentDocument.body;
     var editorDoc  = editorIframe.contentDocument;
@@ -489,4 +520,8 @@
               '<div class="ra-cit-tier-label">Tier 1 \\u2014 UWM Knowledge Base</div>',
               '<div class="ra-cit-item">',
                 '<a href="https://kb.uwm.edu" target="_blank">Setting Up Your Canvas Course Site</a>',
-                '<div class="ra-cit-excerpt">Step-by-step guide to course creation, enrollment sync, and template use
+                '<div class="ra-cit-excerpt">Step-by-step guide to course creation, enrollment sync, and template use for UWM instructors.</div>',
+              '</div>',
+              '<div class="ra-cit-item">',
+                '<a href="https://kb.uwm.edu" target="_blank">Canvas \\u2014 Adding a TA or Co-instructor</a>',
+                '<div class="ra-cit-excerpt">How to request additional user roles in a Canvas course
