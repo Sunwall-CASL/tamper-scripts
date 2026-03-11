@@ -1,50 +1,47 @@
 // ==UserScript==
 // @name         Neurons - Reply Assistant
 // @namespace    https://uwm-amc.ivanticloud.com/
-// @version      1.19
+// @version      1.20
 // @description  Detects reply/compose dialog, injects AI-assist pop-up with native contentEditable editor.
 // @match        https://uwm-amc.ivanticloud.com/*
 // @grant        none
 // @run-at       document-idle
 // ==/UserScript==
 
-// ── CHANGES IN v1.19 ─────────────────────────────────────────────────────────
+// ── CHANGES IN v1.20 ─────────────────────────────────────────────────────────
 //
-// v1.18 had correct logic (from Claude in Chrome's DOM diagnostics) but was
-// completely broken due to string escaping errors in the CSS injection block:
-// the style array used literal \\n and \\u escape sequences that the JS engine
-// treated as parse errors. This version rewrites the entire file cleanly.
+// FIX 1 — Console spam / script running continuously:
+//   The viewer dialog (ext-comp-2850) was not in knownDialogIds because it
+//   appeared AFTER the 5-second grace period ended. The poller then called
+//   isComposeDialog() on it every 500ms forever, logging "no editable iframe"
+//   each time. It was correctly rejected each time (no insert happened), but
+//   the repeated evaluation produced 100s of console lines and wasted CPU.
 //
-// All v1.18 logic is preserved:
+//   Fix: Any dialog that fails isComposeDialog() is immediately added to
+//   knownDialogIds so it is never evaluated again. This is safe because:
+//   - A viewer dialog that fails the check will never become a compose dialog
+//   - The compose dialog (when it appears) will pass the check and get triggers
+//   - seenDialogs already prevents re-processing dialogs that pass the check
+//   Combined: every dialog is evaluated exactly once, then filed away.
 //
-// FIX 1 — Rolling snapshot (triggers before Reply is clicked):
-//   For the first 10 poller ticks (5 seconds), every dialog found is added to
-//   knownDialogIds instead of being passed to handleDialog(). After tick 10,
-//   normal detection resumes. This gives Neurons time to lazy-render the email
-//   viewer dialog before we start watching for new compose dialogs.
+// FIX 2 — Triggers disappear after Insert:
+//   After a successful Insert, closePopup() + removeTriggers() were both
+//   called, removing the badge and toolbar button. The user had no way to
+//   re-open the assistant to check something else or insert again.
 //
-// FIX 2 — isComposeDialog() now uses iframe editability as its PRIMARY check:
-//   DOM diagnostic confirmed BOTH the viewer and compose dialogs have
-//   .x-html-editor-tb, so toolbar class checks cannot distinguish them.
-//   The only reliable signal: the compose dialog contains an iframe whose
-//   body.isContentEditable === true OR whose document.designMode === 'on'.
+//   Fix: insertDraftAtTop() on success now calls closePopup() only — it does
+//   NOT call removeTriggers(). The badge and toolbar button remain visible.
+//   The user can click either one to open a fresh assistant panel.
+//   removeTriggers() is still called when the compose dialog closes (clean
+//   up) and when the user explicitly Discards from the minibar.
 //
-// FIX 3 — getEditorIframe() checks designMode === 'on' as secondary path:
-//   ExtJS sets document.designMode = 'on' (not a contenteditable attribute).
-//   body.isContentEditable (boolean) correctly returns true when designMode
-//   is on, but the designMode check is added as belt-and-suspenders.
-//
-// FIX 4 — insertDraftAtTop() uses insertAdjacentHTML('afterbegin'):
-//   Replaces the manual node-prepend loop which caused node-adoption errors
-//   when the editor iframe uses designMode rather than contenteditable attr.
-//
-// FIX 5 — Cancel + Minimize buttons: e.stopPropagation() added so the
-//   overlay's backdrop click handler cannot swallow button clicks.
-//   pointer-events: all added to all interactive elements.
-//
-// FIX 6 — After Discard from minibar, seenDialogs[dialogEl.id] is cleared
-//   so the poller re-processes the still-open compose dialog and re-injects
-//   triggers rather than leaving the user with no way to reopen the assistant.
+// All fixes from v1.19 retained:
+//   - Rolling 5-second grace period (snapshot ticks)
+//   - isComposeDialog() uses editable iframe as primary check
+//   - getEditorIframe() checks designMode === 'on'
+//   - insertDraftAtTop() uses insertAdjacentHTML('afterbegin')
+//   - e.stopPropagation() on Cancel, Minimize, Insert, thumbs
+//   - Discard from minibar clears seenDialogs[dialogEl.id]
 
 (function () {
   'use strict';
@@ -58,7 +55,6 @@
   var isMinimized  = false;
   var escListener  = null;
 
-  // Rolling snapshot counters (Fix 1)
   var pollTickCount  = 0;
   var SNAPSHOT_TICKS = 10; // 10 x 500ms = 5-second grace period
 
@@ -108,37 +104,32 @@
     return thread;
   }
 
-  // ── IS COMPOSE DIALOG? (Fix 2) ────────────────────────────────────────────────
-  // DOM diagnostic confirmed both viewer and compose dialogs have .x-html-editor-tb.
-  // The ONLY reliable distinguisher: the compose dialog's iframe has
-  // body.isContentEditable === true (because ExtJS sets designMode = 'on' on it).
-  // The viewer's iframe has isContentEditable === false / designMode === 'off'.
+  // ── IS COMPOSE DIALOG? ────────────────────────────────────────────────────────
+  // PRIMARY check: does this dialog contain an iframe whose body is editable?
+  // Both viewer and compose dialogs have .x-html-editor-tb, so toolbar classes
+  // cannot distinguish them. Only the compose dialog's iframe has
+  // isContentEditable === true (because ExtJS sets designMode = 'on' on it).
   function isComposeDialog(dialogEl) {
-    // Primary: editable iframe check
     var iframes = dialogEl.querySelectorAll('iframe');
     for (var k = 0; k < iframes.length; k++) {
       try {
         var iDoc = iframes[k].contentDocument;
         if (iDoc && iDoc.body &&
             (iDoc.body.isContentEditable || iDoc.designMode === 'on')) {
-          console.log(LOG, 'isComposeDialog: editable iframe (index ' + k +
-            ', designMode=' + iDoc.designMode + ') — is compose');
           return true;
         }
       } catch (e) {}
     }
-    // Secondary (fallback when iframes haven't loaded yet)
+    // Fallback: if iframes haven't rendered yet, use toolbar class hint
     if (iframes.length === 0) {
       if (dialogEl.querySelector('.x-html-editor-tb, .x-html-editor-wrap')) {
-        console.log(LOG, 'isComposeDialog: html-editor class (no iframes yet) — is compose');
         return true;
       }
     }
-    console.log(LOG, 'isComposeDialog: no editable iframe — treating as viewer');
     return false;
   }
 
-  // ── FIND COMPOSE EDITOR IFRAME (Fix 3) ───────────────────────────────────────
+  // ── FIND COMPOSE EDITOR IFRAME ───────────────────────────────────────────────
   function getEditorIframe(dialogEl) {
     var iframes  = dialogEl.querySelectorAll('iframe');
     var fallback = null;
@@ -318,6 +309,9 @@
   }
 
   // ── REMOVE TRIGGERS ───────────────────────────────────────────────────────────
+  // Only called when the compose dialog closes or user explicitly Discards.
+  // NOT called after a successful Insert — triggers stay visible so the user
+  // can open the assistant again to add more or check something else.
   function removeTriggers() {
     var innerDoc = getInnerDoc();
     if (innerDoc) {
@@ -447,8 +441,7 @@
     warn.addEventListener('click', function (e) { if (e.target === warn) warn.remove(); });
   }
 
-  // ── INSERT DRAFT AT TOP (Fix 4) ───────────────────────────────────────────────
-  // insertAdjacentHTML('afterbegin') avoids node-adoption errors with designMode iframes.
+  // ── INSERT DRAFT AT TOP ───────────────────────────────────────────────────────
   function insertDraftAtTop(editorIframe, draftHtml) {
     var editorBody = editorIframe.contentDocument.body;
     var editorDoc  = editorIframe.contentDocument;
@@ -484,7 +477,7 @@
           '<span id="uwm-ra-searching"><span class="ra-spinner"></span>Searching knowledge base\u2026</span>' +
           '<div class="ra-header-actions">' +
             '<button id="uwm-ra-minimize-btn" title="Minimize \u2014 draft preserved">\u2013</button>' +
-            '<span class="ra-version">v1.19</span>' +
+            '<span class="ra-version">v1.20</span>' +
           '</div>' +
         '</div>' +
 
@@ -590,13 +583,12 @@
 
     document.getElementById('uwm-ra-editor').focus();
 
-    // Simulate search completing
     setTimeout(function () {
       var el = document.getElementById('uwm-ra-searching');
       if (el) el.innerHTML = '<span style="color:#4ade80;font-size:12px;">&#10003; Search complete</span>';
     }, 2000);
 
-    // Toolbar buttons — mousedown + preventDefault keeps editor focus
+    // Toolbar
     var tbBtns = document.querySelectorAll('#uwm-ra-toolbar .ra-tb-btn[data-cmd]');
     for (var t = 0; t < tbBtns.length; t++) {
       (function (btn) {
@@ -612,13 +604,12 @@
       if (url && url !== 'https://') execCmd('createLink', url);
     });
 
-    // Minimize — stopPropagation so overlay click handler doesn't interfere (Fix 5)
     document.getElementById('uwm-ra-minimize-btn').addEventListener('click', function (e) {
       e.stopPropagation();
       minimizePopup();
     });
 
-    // Insert (Fix 4 — insertAdjacentHTML path in insertDraftAtTop)
+    // INSERT — closes popup but does NOT remove triggers so user can re-open
     document.getElementById('uwm-ra-insert').addEventListener('click', function (e) {
       e.stopPropagation();
       var html = document.getElementById('uwm-ra-editor').innerHTML;
@@ -635,14 +626,16 @@
       try {
         insertDraftAtTop(editorIframe, html);
         closePopup();
-        removeTriggers();
+        // Intentionally NOT calling removeTriggers() here.
+        // The badge and toolbar button remain visible so the user can
+        // re-open the assistant to check something else or insert again.
+        console.log(LOG, 'Insert complete — triggers remain for re-use');
       } catch (e2) {
         console.error(LOG, 'Insert failed:', e2);
         alert('[UWM Reply Assistant] Insert failed \u2014 see console. Error: ' + e2.message);
       }
     });
 
-    // Cancel — stopPropagation (Fix 5)
     document.getElementById('uwm-ra-cancel').addEventListener('click', function (e) {
       e.stopPropagation();
       showCancelWarning();
@@ -661,7 +654,6 @@
       console.log(LOG, 'Thumbs down');
     });
 
-    // Backdrop click minimizes (draft preserved)
     overlay.addEventListener('click', function (e) {
       if (e.target === overlay) minimizePopup();
     });
@@ -676,12 +668,11 @@
 
     document.getElementById('uwm-ra-mini-restore').addEventListener('click', restorePopup);
 
-    // Discard — clear seenDialogs so poller re-injects triggers (Fix 6)
     document.getElementById('uwm-ra-mini-discard').addEventListener('click', function () {
       console.log(LOG, 'Draft discarded from minibar');
       closePopup();
       removeTriggers();
-      delete seenDialogs[dialogEl.id]; // allow poller to re-process this dialog
+      delete seenDialogs[dialogEl.id];
     });
 
     console.log(LOG, 'Pop-up displayed');
@@ -693,7 +684,9 @@
     if (knownDialogIds[dialogEl.id]) return;
 
     if (!isComposeDialog(dialogEl)) {
-      console.log(LOG, 'Dialog ' + dialogEl.id + ' skipped — no editable iframe');
+      // File it away immediately so the poller never evaluates it again (Fix 1)
+      knownDialogIds[dialogEl.id] = true;
+      console.log(LOG, 'Dialog ' + dialogEl.id + ' is not compose — added to known, will not re-check');
       return;
     }
 
@@ -724,9 +717,7 @@
     }, 800);
   }
 
-  // ── POLL FOR NEW DIALOGS (Fix 1 — rolling snapshot) ──────────────────────────
-  // For the first SNAPSHOT_TICKS ticks, add all dialogs to knownDialogIds.
-  // After that, call handleDialog() on dialogs not already known.
+  // ── POLL FOR NEW DIALOGS ──────────────────────────────────────────────────────
   function startPoller() {
     if (pollInterval) clearInterval(pollInterval);
     pollInterval = setInterval(function () {
@@ -737,22 +728,15 @@
       var dialogs = innerDoc.querySelectorAll('.x-frs-modal-form');
 
       if (pollTickCount <= SNAPSHOT_TICKS) {
-        // Grace period: absorb all current dialogs as "known"
-        var added = 0;
+        // Grace period: absorb all current dialogs as known
         for (var s = 0; s < dialogs.length; s++) {
           if (!knownDialogIds[dialogs[s].id]) {
             knownDialogIds[dialogs[s].id] = true;
-            added++;
           }
         }
-        if (added > 0) {
-          console.log(LOG, 'Grace tick ' + pollTickCount + '/' + SNAPSHOT_TICKS +
-            ' — absorbed ' + added + ' dialog(s) into snapshot');
-        }
-        return; // don't call handleDialog during grace period
+        return;
       }
 
-      // Normal mode — only process dialogs not in knownDialogIds
       for (var i = 0; i < dialogs.length; i++) {
         handleDialog(dialogs[i], innerDoc);
       }
@@ -777,7 +761,7 @@
     }
     startObserver(innerDoc);
     startPoller();
-    console.log(LOG, 'v1.19 initialized — 5-second grace period active');
+    console.log(LOG, 'v1.20 initialized — 5-second grace period active');
   }
 
   if (document.readyState === 'loading') {
