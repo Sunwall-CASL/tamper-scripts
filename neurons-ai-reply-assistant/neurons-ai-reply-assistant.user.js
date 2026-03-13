@@ -1,41 +1,28 @@
 // ==UserScript==
 // @name         Neurons - Reply Assistant
 // @namespace    https://uwm-amc.ivanticloud.com/
-// @version      1.22
+// @version      1.23
 // @description  Detects reply/compose dialog, injects AI-assist pop-up with native contentEditable editor.
 // @match        https://uwm-amc.ivanticloud.com/*
 // @grant        none
 // @run-at       document-idle
 // ==/UserScript==
 
-// ── CHANGES IN v1.22 ─────────────────────────────────────────────────────────
+// ── CHANGES IN v1.23 ─────────────────────────────────────────────────────────
 //
-// FIX 1 — Ordered / unordered list buttons did not work:
-//   execCmd() was calling document.execCommand() on the OUTER page document,
-//   which has no selection. Lists require execCommand on the contentEditable
-//   div's own document. Fixed: execCmd() now calls
-//   editor.ownerDocument.execCommand() so the command always runs on the
-//   correct document regardless of where focus is.
+// FIX — Ordered / unordered list buttons appeared non-functional:
+//   Diagnostic confirmed execCommand('insertUnorderedList') and
+//   ('insertOrderedList') were actually executing correctly and returning true,
+//   and the DOM was being updated with valid <ul>/<ol>/<li> markup. The visual
+//   problem was that the Neurons/Ivanti host page's ext-all.css global reset
+//   applies `list-style: none` and `padding-left: 0` to ALL ul/ol on the page,
+//   overriding browser defaults inside the contentEditable editor. The fix is
+//   scoped CSS added to injectStyles() that restores list-style, padding, and
+//   display:list-item exclusively inside #uwm-ra-editor using !important to
+//   win the specificity battle against the host reset.
+//   No changes to execCmd() — it was correct in v1.22.
 //
-// FIX 2 — Links open in same tab:
-//   createLink inserts a plain <a> with no target. After execCommand we find
-//   all <a> elements in the editor that are missing target="_blank" and add it.
-//   Also adds rel="noopener noreferrer" for security.
-//
-// FIX 3 — "Clear" button tooltip / label:
-//   Renamed to "✕ Clear formatting" with title="Remove bold, italic, underline,
-//   and color from selected text" so purpose is obvious on hover.
-//
-// FIX 4 — Image drop button + popup (adapted from ImageDrop v1.6):
-//   Added an "🖼 Image" toolbar button. Clicking it opens a full-screen drop
-//   zone overlay (same design as ImageDrop). The user drops an image file; it
-//   is inserted as a base64 <img> at the current cursor position in the
-//   Reply Assistant editor (not the Neurons compose window). The image is
-//   included in the HTML when Insert into Email is clicked, exactly like any
-//   other content. No keyboard shortcut — button only, integrated into the
-//   existing toolbar flow.
-//
-// All v1.21 fixes retained.
+// All v1.22 fixes retained.
 
 (function () {
   'use strict';
@@ -144,11 +131,10 @@
   }
 
   // ── TOOLBAR execCommand HELPER ────────────────────────────────────────────────
-  // CRITICAL FIX: must call execCommand on editor.ownerDocument, not on
-  // `document` (the outer page). Using the outer document's execCommand operates
-  // on the outer page's selection (which is always empty), so list commands were
-  // silently no-ops. Bold/italic/underline happened to work because the browser
-  // still applied them in some environments, but lists never worked.
+  // Must call execCommand on editor.ownerDocument, not on `document` (the outer
+  // page). The outer document's execCommand operates on the outer page's
+  // selection (always empty). Bold/italic/underline happen to work in some
+  // environments despite this, but list commands require the correct document.
   function execCmd(cmd, value) {
     var editor = document.getElementById('uwm-ra-editor');
     if (!editor) return;
@@ -278,6 +264,28 @@
     css += '}';
     css += '#uwm-ra-editor a { color: #1a5bb8; }';
     css += '#uwm-ra-editor img { max-width: 100%; height: auto; display: block; margin: 6px 0; }';
+
+    // ── List style fix (v1.23) ────────────────────────────────────────────────
+    // The Neurons/Ivanti host page's ext-all.css applies a global CSS reset:
+    //   ol, ul { list-style: none; padding: 0; }
+    // This strips bullets, numbers, and indentation from any <ul>/<ol> on the
+    // page — including those created by execCommand inside our contentEditable
+    // editor. The commands run correctly and produce valid markup, but nothing
+    // is visible. These scoped rules override the host reset using !important,
+    // restoring proper list rendering exclusively inside #uwm-ra-editor.
+    css += '#uwm-ra-editor ul,';
+    css += '#uwm-ra-editor ol {';
+    css += '  list-style: initial !important;';
+    css += '  padding-left: 2em !important;';
+    css += '  margin: 0.5em 0 !important;';
+    css += '}';
+    css += '#uwm-ra-editor ul { list-style-type: disc !important; }';
+    css += '#uwm-ra-editor ol { list-style-type: decimal !important; }';
+    css += '#uwm-ra-editor li {';
+    css += '  display: list-item !important;';
+    css += '  list-style-position: outside !important;';
+    css += '}';
+    // ─────────────────────────────────────────────────────────────────────────
 
     css += '#uwm-ra-footer { padding: 10px 16px; border-top: 1px solid #e2e5ec; display: flex; align-items: center; gap: 10px; background: #f7f8fa; flex-shrink: 0; }';
     css += '.ra-btn { padding: 7px 18px; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; border: none; transition: background 0.15s; pointer-events: all; }';
@@ -724,7 +732,7 @@
           '<span id="uwm-ra-searching"><span class="ra-spinner"></span>Searching knowledge base\u2026</span>' +
           '<div class="ra-header-actions">' +
             '<button id="uwm-ra-minimize-btn" title="Minimize \u2014 draft preserved">\u2013</button>' +
-            '<span class="ra-version">v1.22</span>' +
+            '<span class="ra-version">v1.23</span>' +
           '</div>' +
         '</div>' +
 
@@ -1024,7 +1032,7 @@
     }
     startObserver(innerDoc);
     startPoller();
-    console.log(LOG, 'v1.22 initialized — 5-second grace period active');
+    console.log(LOG, 'v1.23 initialized — 5-second grace period active');
   }
 
   if (document.readyState === 'loading') {
