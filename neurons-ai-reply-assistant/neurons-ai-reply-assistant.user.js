@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Neurons - Reply Assistant
 // @namespace    https://uwm-amc.ivanticloud.com/
-// @version      1.31
+// @version      1.32
 // @description  Detects reply/compose dialog, searches UWM KB + Canvas Community, injects AI-assist pop-up.
 // @match        https://uwm-amc.ivanticloud.com/*
 // @grant        GM_xmlhttpRequest
@@ -10,55 +10,45 @@
 // @run-at       document-idle
 // ==/UserScript==
 
+// ── CHANGES IN v1.32 ─────────────────────────────────────────────────────────
+//
+// BUG FIX — Insert function not working (content disappears on Save):
+//   Root cause identified via diagnostics: contentWindow.Ext is undefined, but
+//   window.Ext IS accessible (version 3.1.0 confirmed present on outer page).
+//   
+//   insertDraftAtTop() rewritten to:
+//     1. Access ExtJS via window.Ext instead of contentWindow.Ext
+//     2. Find EmailBody component via ComponentMgr.all.map (Name === 'EmailBody')
+//     3. Wrap inserted HTML in elementToProof div with font-size: 12pt
+//        (matches Neurons' default wrapper, fixes font size mismatch)
+//     4. Call setValue(wrappedHtml + currentValue) to update ExtJS state
+//     5. Content now persists when Save is clicked AND displays at correct size
+//
+//   Signature changed back to: insertDraftAtTop(dialogEl, draftHtml)
+//
+// All v1.31 changes retained: CETL→CASL, signature removal after "Best,"
+//
+// All v1.30 functionality retained: KB search with bare numeric href handling,
+// Canvas Community search, minimize/restore, image drop, citations panel.
+
 // ── CHANGES IN v1.31 ─────────────────────────────────────────────────────────
 //
-// BUG FIX — Inserted content disappears when Save is clicked:
-//   Root cause confirmed via diagnostics: insertAdjacentHTML modifies DOM only,
-//   not ExtJS component's internal value. Neurons saves from getValue(), not DOM.
-//   insertDraftAtTop() rewritten to:
-//     1. Find EmailBody ExtJS component by Name property
-//     2. Wrap inserted HTML in <div class="elementToProof"> with explicit
-//        font-family and font-size: 12pt (matches Neurons' default wrapper)
-//     3. Call setValue(wrappedHtml + currentValue) to update ExtJS state
-//   Signature changed: insertDraftAtTop(dialogEl, draftHtml) — now receives
-//   dialog element instead of iframe, finds component internally.
+// BUG FIX — Inserted content disappears when Save is clicked (ATTEMPTED FIX):
+//   Diagnostics revealed: insertAdjacentHTML modifies DOM only, not ExtJS state.
+//   Neurons saves from getValue(), not DOM. Attempted to use setValue() but
+//   contentWindow.Ext was inaccessible. Fix deferred to v1.32.
 //
 // BUG FIX — Font size mismatch:
 //   Diagnostics revealed Neurons wraps all content in elementToProof div with
-//   inline style font-size: 12pt. Now wrapping inserted content identically.
+//   inline style font-size: 12pt. Wrapper added to match (implemented in v1.32).
 //
 // CETL → CASL replacement:
 //   Changed all references from "CETL" to "CASL" (Center for Advancing Student
 //   Learning) across editor scaffolds, console logs, and UI text.
 //
 // Signature removal:
-//   Editor scaffolds now end at "Best," — removed Lane's signature line as
-//   Neurons auto-appends signature on send.
-//
-// All v1.30 functionality retained: KB search with bare numeric href handling,
-// Canvas Community search, minimize/restore, image drop, citations panel.
-
-// ── CHANGES IN v1.30 ─────────────────────────────────────────────────────────
-//
-// BUG FIX — Keyword extraction too greedy (known issue, deferred to v1.32):
-//   "Vevox registration" queries "Vevox registration" → 0 results (4 Vevox
-//   articles exist in KB). Product names should be primary search terms, action
-//   words secondary. Fix deferred — v1.31 focuses on Insert bug only.
-//
-// BUG FIX — Intermittent init failures (investigation deferred):
-//   Occasional timeout when compose dialog appears. Needs extended grace period
-//   or additional retry logic. Deferred to allow focused testing of Insert fix.
-
-// ── CHANGES IN v1.29 ─────────────────────────────────────────────────────────
-//
-// BUG FIX — UWM KB parseKBResults returning category links instead of articles:
-//   Live inspection confirmed that article hrefs appear in two formats:
-//     1. page.php?id=NNN (already handled in v1.28)
-//     2. bare numeric strings like "146742" (NEW in v1.29)
-//   Added regex check /^\d+$/ to detect bare numeric hrefs in both Pass 1
-//   and Pass 2. When found, constructs full URL as:
-//   https://kb.uwm.edu/page.php?id= + numeric ID
-//   Removed verbose diagnostic logging (sample array) - kept essential logs.
+//   Editor scaffolds now end at "Best," — removed signature line as Neurons
+//   auto-appends signature on send.
 
 (function () {
   'use strict';
@@ -795,24 +785,18 @@
   }
 
   // ── INSERT DRAFT INTO NEURONS COMPOSE ────────────────────────────────────────
-  // REWRITTEN in v1.31 to use ExtJS setValue() instead of DOM manipulation.
-  // This ensures content persists when Neurons Save button is clicked.
+  // REWRITTEN in v1.32 to use window.Ext (diagnostic confirmed this works).
+  // Ensures content persists when Neurons Save button is clicked.
   function insertDraftAtTop(dialogEl, draftHtml) {
-    var innerDoc = getInnerDoc();
-    if (!innerDoc) {
-      console.error(LOG, 'Insert failed: could not get inner document');
-      alert('[UWM Reply Assistant] Insert failed: could not access Neurons frame.');
+    // Access ExtJS via window.Ext (confirmed available via diagnostics)
+    var Ext = window.Ext;
+    
+    if (!Ext || !Ext.ComponentMgr) {
+      console.error(LOG, 'Insert failed: ExtJS not accessible via window.Ext');
+      alert('[UWM Reply Assistant] ExtJS not found. Cannot insert content.');
       return;
     }
 
-    var appFrame = getAppFrame();
-    if (!appFrame || !appFrame.contentWindow || !appFrame.contentWindow.Ext) {
-      console.error(LOG, 'Insert failed: Ext not found in app frame');
-      alert('[UWM Reply Assistant] Insert failed: ExtJS not accessible.');
-      return;
-    }
-
-    var Ext = appFrame.contentWindow.Ext;
     var emailBodyComp = null;
 
     // Find EmailBody component by Name property
@@ -827,13 +811,13 @@
 
     if (!emailBodyComp) {
       console.error(LOG, 'Insert failed: could not find EmailBody component');
-      alert('[UWM Reply Assistant] Insert failed: could not find Neurons email body field.');
+      alert('[UWM Reply Assistant] Could not find Neurons email body field.');
       return;
     }
 
     if (typeof emailBodyComp.setValue !== 'function' || typeof emailBodyComp.getValue !== 'function') {
       console.error(LOG, 'Insert failed: EmailBody component missing setValue/getValue methods');
-      alert('[UWM Reply Assistant] Insert failed: EmailBody component API unavailable.');
+      alert('[UWM Reply Assistant] EmailBody component API unavailable.');
       return;
     }
 
@@ -867,7 +851,7 @@
           '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#7db3e8" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>' +
           '<span class="ra-logo">Reply Assistant</span>' +
           '<span id="uwm-ra-searching"><span class="ra-spinner"></span>Searching\u2026</span>' +
-          '<div class="ra-header-actions"><button id="uwm-ra-minimize-btn">\u2013</button><span class="ra-version">v1.31</span></div>' +
+          '<div class="ra-header-actions"><button id="uwm-ra-minimize-btn">\u2013</button><span class="ra-version">v1.32</span></div>' +
         '</div>' +
         '<div id="uwm-ra-confidence"><span class="ra-dot ra-dot-yellow"></span>' +
           '<strong style="font-size:12.5px;color:#92400e;">Searching\u2026</strong>' +
@@ -941,7 +925,7 @@
     document.getElementById('uwm-ra-image-btn').addEventListener('mousedown', function (e) { e.preventDefault(); showImageDropPopup(); });
     document.getElementById('uwm-ra-minimize-btn').addEventListener('click', function (e) { e.stopPropagation(); minimizePopup(); });
 
-    // UPDATED in v1.31: Insert button now passes dialogEl instead of editorIframe
+    // Insert button handler
     document.getElementById('uwm-ra-insert').addEventListener('click', function (e) {
       e.stopPropagation();
       var html = document.getElementById('uwm-ra-editor').innerHTML;
@@ -1050,7 +1034,7 @@
       return;
     }
     startObserver(); startPoller();
-    console.log(LOG, 'v1.31 initialized — 5-second grace period active');
+    console.log(LOG, 'v1.32 initialized — 5-second grace period active');
   }
 
   if (document.readyState === 'loading') { document.addEventListener('DOMContentLoaded', function () { setTimeout(init, 1000); }); }
