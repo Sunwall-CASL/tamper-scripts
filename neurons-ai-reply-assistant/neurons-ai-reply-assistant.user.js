@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Neurons - Reply Assistant
 // @namespace    https://uwm-amc.ivanticloud.com/
-// @version      1.30
+// @version      1.31
 // @description  Detects reply/compose dialog, searches UWM KB + Canvas Community, injects AI-assist pop-up.
 // @match        https://uwm-amc.ivanticloud.com/*
 // @grant        GM_xmlhttpRequest
@@ -9,6 +9,45 @@
 // @connect      community.instructure.com
 // @run-at       document-idle
 // ==/UserScript==
+
+// ── CHANGES IN v1.31 ─────────────────────────────────────────────────────────
+//
+// BUG FIX — Inserted content disappears when Save is clicked:
+//   Root cause confirmed via diagnostics: insertAdjacentHTML modifies DOM only,
+//   not ExtJS component's internal value. Neurons saves from getValue(), not DOM.
+//   insertDraftAtTop() rewritten to:
+//     1. Find EmailBody ExtJS component by Name property
+//     2. Wrap inserted HTML in <div class="elementToProof"> with explicit
+//        font-family and font-size: 12pt (matches Neurons' default wrapper)
+//     3. Call setValue(wrappedHtml + currentValue) to update ExtJS state
+//   Signature changed: insertDraftAtTop(dialogEl, draftHtml) — now receives
+//   dialog element instead of iframe, finds component internally.
+//
+// BUG FIX — Font size mismatch:
+//   Diagnostics revealed Neurons wraps all content in elementToProof div with
+//   inline style font-size: 12pt. Now wrapping inserted content identically.
+//
+// CETL → CASL replacement:
+//   Changed all references from "CETL" to "CASL" (Center for Advancing Student
+//   Learning) across editor scaffolds, console logs, and UI text.
+//
+// Signature removal:
+//   Editor scaffolds now end at "Best," — removed Lane's signature line as
+//   Neurons auto-appends signature on send.
+//
+// All v1.30 functionality retained: KB search with bare numeric href handling,
+// Canvas Community search, minimize/restore, image drop, citations panel.
+
+// ── CHANGES IN v1.30 ─────────────────────────────────────────────────────────
+//
+// BUG FIX — Keyword extraction too greedy (known issue, deferred to v1.32):
+//   "Vevox registration" queries "Vevox registration" → 0 results (4 Vevox
+//   articles exist in KB). Product names should be primary search terms, action
+//   words secondary. Fix deferred — v1.31 focuses on Insert bug only.
+//
+// BUG FIX — Intermittent init failures (investigation deferred):
+//   Occasional timeout when compose dialog appears. Needs extended grace period
+//   or additional retry logic. Deferred to allow focused testing of Insert fix.
 
 // ── CHANGES IN v1.29 ─────────────────────────────────────────────────────────
 //
@@ -20,57 +59,6 @@
 //   and Pass 2. When found, constructs full URL as:
 //   https://kb.uwm.edu/page.php?id= + numeric ID
 //   Removed verbose diagnostic logging (sample array) - kept essential logs.
-//
-// All v1.28 functionality retained: Canvas Community search, minimize/restore,
-// image drop, search orchestration, citations panel, editor scaffold.
-
-// ── CHANGES IN v1.27 ─────────────────────────────────────────────────────────
-//
-// BUG FIX — UWM KB returned 0 results despite status 200:
-//   Live inspection of kb.uwm.edu/search.php confirmed the results page uses
-//   a plain HTML <table> — one <tr> per result, each containing an <a> whose
-//   href matches /page.php?id=NNN. None of our CSS class selectors matched
-//   this structure, and the fallback link scan was also missing them (the
-//   href values are relative paths without a leading slash in some cases).
-//   parseKBResults() is replaced with a single targeted scan: find all
-//   <a href> elements whose href contains "page.php?id=", make the URL
-//   absolute, and return up to 5 results. No class names required.
-//   The table layout has no excerpt text per row, so excerpt is empty —
-//   titles only in the citations panel for Tier 1.
-//
-// All v1.27 code retained (restored isComposeDialog, search architecture,
-// dynamic citations panel, editor scaffold, list CSS fix).
-
-//
-// ROOT CAUSE IDENTIFIED — isComposeDialog broken in v1.24/v1.25:
-//   v1.24 added .x-html-editor-tb as a PRIMARY check for compose dialogs.
-//   The viewer dialog in Neurons also has .x-html-editor-tb (read-only toolbar),
-//   so this check produced false positives on the viewer. This caused the
-//   trigger button to appear in the viewer and Insert to target the wrong iframe.
-//   v1.23's isComposeDialog (contentEditable iframe check only) was correct
-//   and is restored here verbatim.
-//
-// REVERTED — isComposeDialog: back to v1.23 logic exactly.
-//   Checks for a contentEditable iframe inside the dialog. The viewer's toolbar
-//   iframe is NOT contentEditable; only the compose editor iframe is.
-//   The .x-html-editor-tb check is removed entirely.
-//
-// REVERTED — startPoller: back to v1.23 simple loop, no numeric ID logic.
-//   The numeric ID approach in v1.25 was unnecessary complexity built on top
-//   of a broken isComposeDialog. With the correct discriminator restored,
-//   the simple poller loop works as it did in v1.23.
-//
-// REMOVED — getNumericId helper (no longer needed).
-//
-// RETAINED — all v1.25 additions:
-//   KB search URL fix (search.php?q=), UW KB sf- selectors, Canvas Community
-//   search, keyword extraction, dynamic citations panel, editor scaffold,
-//   currentSearchState, escHtml/escAttr, updatePopupWithResults,
-//   updateEditorWithResults, renderCitations, data-ra-placeholder tracking.
-//
-// RETAINED — all v1.23 fixes:
-//   List CSS override, execCommand document scope, single-call-site trigger
-//   lifecycle, widest-iframe frame selection.
 
 (function () {
   'use strict';
@@ -181,7 +169,7 @@
       getting:1,let:1,know:1,able:1,just:1,also:1,too:1,very:1,like:1,
       help:1,use:1,using:1,used:1,make:1,making:1,made:1,not:1,from:1,
       into:1,through:1,during:1,before:1,after:1,about:1,between:1,
-      lane:1,uwm:1,cetl:1,instructor:1,student:1,professor:1,email:1,
+      lane:1,uwm:1,cetl:1,casl:1,instructor:1,student:1,professor:1,email:1,
       message:1,issue:1,problem:1,question:1,there:1,more:1,some:1,
       any:1,all:1,each:1,sent:1,send:1,sending:1,receive:1,received:1,
       try:1,trying:1,tried:1,see:1,seeing:1,saw:1,look:1,looking:1,
@@ -245,7 +233,7 @@
 
     var results = [], seen = {};
 
-    // Pass 1: exact UWM KB article URL patterns — now handles both formats
+    // Pass 1: exact UWM KB article URL patterns — handles both page.php?id= and bare numeric
     for (var i = 0; i < allLinks.length && results.length < 5; i++) {
       var link = allLinks[i];
       var raw  = link.getAttribute('href') || '';
@@ -254,11 +242,11 @@
 
       var href = null;
 
-      // Pattern 1: page.php?id=NNN or document.php?id=NNN (existing)
+      // Pattern 1: page.php?id=NNN or document.php?id=NNN
       if (/page\.php\?id=/i.test(raw) || /document\.php\?id=/i.test(raw)) {
         href = /^https?:\/\//i.test(raw) ? raw : 'https://kb.uwm.edu' + (raw.charAt(0) === '/' ? '' : '/') + raw;
       }
-      // Pattern 2: bare numeric string like "146742" (NEW in v1.29)
+      // Pattern 2: bare numeric string like "146742" (v1.29 addition)
       else if (/^\d+$/.test(raw)) {
         href = 'https://kb.uwm.edu/page.php?id=' + raw;
       }
@@ -270,8 +258,7 @@
       }
     }
 
-    // Pass 2: any link inside a <td> with meaningful text — catches alternate
-    // URL formats the fetched page might use
+    // Pass 2: any link inside a <td> with meaningful text — catches alternate URL formats
     if (results.length === 0) {
       var tdLinks = doc.querySelectorAll('td a[href]');
       console.log(LOG, 'Tier 1 Pass 2: <td> links found:', tdLinks.length);
@@ -517,7 +504,7 @@
       state.keywords.slice(0, 2).join(' ').replace(/\w\S*/g, function (t) { return t.charAt(0).toUpperCase() + t.slice(1); });
 
     var html = '<p>Hi [Instructor Name],</p>';
-    html += '<p>Thank you for reaching out to UWM CETL support.</p>';
+    html += '<p>Thank you for reaching out to UWM CASL support.</p>';
     html += '<p>Based on your question about ' + escHtml(topicPhrase) + ', here are some resources that may help:</p>';
     html += '<ul>';
     allResults.slice(0, 5).forEach(function (r) {
@@ -527,7 +514,7 @@
     });
     html += '</ul>';
     html += '<p>Please let me know if these resources address your question, or if you need additional assistance.</p>';
-    html += '<p>Best,<br>Lane<br>CETL Teaching, Learning &amp; Technology Consultant</p>';
+    html += '<p>Best,</p>';
 
     editor.innerHTML = html;
     editor.removeAttribute('data-ra-placeholder');
@@ -535,11 +522,6 @@
   }
 
   // ── IS COMPOSE DIALOG? ────────────────────────────────────────────────────────
-  // RESTORED to v1.23 logic exactly.
-  // Checks for a contentEditable iframe inside the dialog.
-  // The viewer dialog's iframe is NOT contentEditable — only the compose
-  // editor iframe is. The .x-html-editor-tb check (added in v1.24) caused
-  // false positives because the viewer also has that toolbar, and is removed.
   function isComposeDialog(dialogEl) {
     var iframes = dialogEl.querySelectorAll('iframe');
     for (var k = 0; k < iframes.length; k++) {
@@ -813,12 +795,64 @@
   }
 
   // ── INSERT DRAFT INTO NEURONS COMPOSE ────────────────────────────────────────
-  function insertDraftAtTop(editorIframe, draftHtml) {
-    var editorBody = editorIframe.contentDocument.body;
-    var editorDoc  = editorIframe.contentDocument;
-    editorBody.insertAdjacentHTML('afterbegin', draftHtml);
-    var evt = editorDoc.createEvent('Event'); evt.initEvent('input', true, true); editorBody.dispatchEvent(evt);
-    console.log(LOG, 'Draft prepended (' + draftHtml.length + ' chars)');
+  // REWRITTEN in v1.31 to use ExtJS setValue() instead of DOM manipulation.
+  // This ensures content persists when Neurons Save button is clicked.
+  function insertDraftAtTop(dialogEl, draftHtml) {
+    var innerDoc = getInnerDoc();
+    if (!innerDoc) {
+      console.error(LOG, 'Insert failed: could not get inner document');
+      alert('[UWM Reply Assistant] Insert failed: could not access Neurons frame.');
+      return;
+    }
+
+    var appFrame = getAppFrame();
+    if (!appFrame || !appFrame.contentWindow || !appFrame.contentWindow.Ext) {
+      console.error(LOG, 'Insert failed: Ext not found in app frame');
+      alert('[UWM Reply Assistant] Insert failed: ExtJS not accessible.');
+      return;
+    }
+
+    var Ext = appFrame.contentWindow.Ext;
+    var emailBodyComp = null;
+
+    // Find EmailBody component by Name property
+    var allComps = Ext.ComponentMgr.all.map;
+    for (var id in allComps) {
+      if (allComps[id].Name === 'EmailBody') {
+        emailBodyComp = allComps[id];
+        console.log(LOG, 'Found EmailBody component, id:', emailBodyComp.id);
+        break;
+      }
+    }
+
+    if (!emailBodyComp) {
+      console.error(LOG, 'Insert failed: could not find EmailBody component');
+      alert('[UWM Reply Assistant] Insert failed: could not find Neurons email body field.');
+      return;
+    }
+
+    if (typeof emailBodyComp.setValue !== 'function' || typeof emailBodyComp.getValue !== 'function') {
+      console.error(LOG, 'Insert failed: EmailBody component missing setValue/getValue methods');
+      alert('[UWM Reply Assistant] Insert failed: EmailBody component API unavailable.');
+      return;
+    }
+
+    // Wrap inserted content in Neurons' standard elementToProof div with explicit 12pt font
+    var wrappedHtml = '<div class="elementToProof" style="font-family: Aptos, Aptos_EmbeddedFont, Aptos_MSFontService, Calibri, Helvetica, sans-serif; font-size: 12pt;">'
+      + draftHtml
+      + '</div>';
+
+    // Prepend to existing content
+    var currentValue = emailBodyComp.getValue() || '';
+    var newValue = wrappedHtml + currentValue;
+
+    try {
+      emailBodyComp.setValue(newValue);
+      console.log(LOG, 'Draft prepended via setValue() with elementToProof wrapper — ' + draftHtml.length + ' chars inserted');
+    } catch (e) {
+      console.error(LOG, 'Insert failed during setValue():', e);
+      alert('[UWM Reply Assistant] Insert failed: ' + e.message);
+    }
   }
 
   // ── POP-UP UI ─────────────────────────────────────────────────────────────────
@@ -833,7 +867,7 @@
           '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#7db3e8" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>' +
           '<span class="ra-logo">Reply Assistant</span>' +
           '<span id="uwm-ra-searching"><span class="ra-spinner"></span>Searching\u2026</span>' +
-          '<div class="ra-header-actions"><button id="uwm-ra-minimize-btn">\u2013</button><span class="ra-version">v1.29</span></div>' +
+          '<div class="ra-header-actions"><button id="uwm-ra-minimize-btn">\u2013</button><span class="ra-version">v1.31</span></div>' +
         '</div>' +
         '<div id="uwm-ra-confidence"><span class="ra-dot ra-dot-yellow"></span>' +
           '<strong style="font-size:12.5px;color:#92400e;">Searching\u2026</strong>' +
@@ -874,9 +908,9 @@
 
     var editor = document.getElementById('uwm-ra-editor');
     editor.innerHTML =
-      '<p>Hi [Instructor Name],</p><p>Thank you for reaching out to UWM CETL support.</p>' +
+      '<p>Hi [Instructor Name],</p><p>Thank you for reaching out to UWM CASL support.</p>' +
       '<p><em>Searching knowledge base \u2014 draft will update momentarily\u2026</em></p>' +
-      '<p>Best,<br>Lane<br>CETL Teaching, Learning &amp; Technology Consultant</p>';
+      '<p>Best,</p>';
     editor.focus();
     editor.addEventListener('input', function () { this.removeAttribute('data-ra-placeholder'); });
 
@@ -907,14 +941,18 @@
     document.getElementById('uwm-ra-image-btn').addEventListener('mousedown', function (e) { e.preventDefault(); showImageDropPopup(); });
     document.getElementById('uwm-ra-minimize-btn').addEventListener('click', function (e) { e.stopPropagation(); minimizePopup(); });
 
+    // UPDATED in v1.31: Insert button now passes dialogEl instead of editorIframe
     document.getElementById('uwm-ra-insert').addEventListener('click', function (e) {
       e.stopPropagation();
       var html = document.getElementById('uwm-ra-editor').innerHTML;
       if (!html || !html.trim()) { alert('[UWM Reply Assistant] Nothing to insert.'); return; }
-      var editorIframe = getEditorIframe(dialogEl);
-      if (!editorIframe) { alert('[UWM Reply Assistant] Could not find the Neurons compose editor.'); closePopup(); return; }
-      try { insertDraftAtTop(editorIframe, html); closePopup(); }
-      catch (e2) { console.error(LOG, 'Insert failed:', e2); alert('[UWM Reply Assistant] Insert failed: ' + e2.message); }
+      try {
+        insertDraftAtTop(dialogEl, html);
+        closePopup();
+      } catch (e2) {
+        console.error(LOG, 'Insert failed:', e2);
+        alert('[UWM Reply Assistant] Insert failed: ' + e2.message);
+      }
     });
 
     document.getElementById('uwm-ra-cancel').addEventListener('click', function (e) { e.stopPropagation(); showCancelWarning(); });
@@ -983,7 +1021,7 @@
     }, 800);
   }
 
-  // ── POLL FOR NEW DIALOGS — v1.23 simple loop, restored ───────────────────────
+  // ── POLL FOR NEW DIALOGS ──────────────────────────────────────────────────────
   function startPoller() {
     if (pollInterval) clearInterval(pollInterval);
     pollInterval = setInterval(function () {
@@ -1012,7 +1050,7 @@
       return;
     }
     startObserver(); startPoller();
-    console.log(LOG, 'v1.29 initialized — 5-second grace period active');
+    console.log(LOG, 'v1.31 initialized — 5-second grace period active');
   }
 
   if (document.readyState === 'loading') { document.addEventListener('DOMContentLoaded', function () { setTimeout(init, 1000); }); }
