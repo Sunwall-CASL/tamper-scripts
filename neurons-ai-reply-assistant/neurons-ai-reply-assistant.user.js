@@ -826,8 +826,8 @@
 
     // Placeholder draft
     document.getElementById('uwm-ra-editor').innerHTML =
-      '<p>Hi [Instructor Name],</p>' +
-      '<p>Thank you for reaching out to UWM CETL support.</p>' +
+      '<p>Hi [Instructor Name] ,</p>' +
+      '<p>Thank you for reaching out to UWM CASL support.</p>' +
       '<p><em>Placeholder draft \u2014 will be replaced with a real AI-generated reply once search and Ollama integration are complete.</em></p>' +
       '<p>Based on what you\u2019ve described, here are some resources that may help:</p>' +
       '<ul>' +
@@ -835,7 +835,7 @@
         '<li>Canvas Community: <a href="https://community.instructure.com" target="_blank" rel="noopener noreferrer">How do I add files to a course?</a></li>' +
       '</ul>' +
       '<p>Please let me know if you have any questions or if this doesn\u2019t resolve the issue \u2014 happy to help further.</p>' +
-      '<p>Best,<br>Lane<br>CETL Teaching, Learning &amp; Technology Consultant</p>';
+      '<p>Best,</p>';
 
     document.getElementById('uwm-ra-editor').focus();
 
