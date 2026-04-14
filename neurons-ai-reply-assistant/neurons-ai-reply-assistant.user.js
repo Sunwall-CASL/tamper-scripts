@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Neurons - Reply Assistant
 // @namespace    https://uwm-amc.ivanticloud.com/
-// @version      1.32
+// @version      1.33
 // @description  Detects reply/compose dialog, searches UWM KB + Canvas Community, injects AI-assist pop-up.
 // @match        https://uwm-amc.ivanticloud.com/*
 // @grant        GM_xmlhttpRequest
@@ -10,45 +10,33 @@
 // @run-at       document-idle
 // ==/UserScript==
 
-// ── CHANGES IN v1.32 ─────────────────────────────────────────────────────────
+// ── CHANGES IN v1.33 ─────────────────────────────────────────────────────────
 //
-// BUG FIX — Insert function not working (content disappears on Save):
-//   Root cause identified via diagnostics: contentWindow.Ext is undefined, but
-//   window.Ext IS accessible (version 3.1.0 confirmed present on outer page).
-//   
-//   insertDraftAtTop() rewritten to:
-//     1. Access ExtJS via window.Ext instead of contentWindow.Ext
-//     2. Find EmailBody component via ComponentMgr.all.map (Name === 'EmailBody')
-//     3. Wrap inserted HTML in elementToProof div with font-size: 12pt
-//        (matches Neurons' default wrapper, fixes font size mismatch)
-//     4. Call setValue(wrappedHtml + currentValue) to update ExtJS state
-//     5. Content now persists when Save is clicked AND displays at correct size
+// BUG FIX — Insert function not working (v1.31/v1.32 ExtJS approach failed):
+//   Root cause: window.Ext is inaccessible when Insert button is clicked, even
+//   though diagnostics showed it exists at page load. ExtJS ComponentMgr approach
+//   was breaking with "ExtJS not found" alert.
 //
-//   Signature changed back to: insertDraftAtTop(dialogEl, draftHtml)
+//   SOLUTION: Reverted insertDraftAtTop() to v1.23's proven DOM approach:
+//     - Use insertAdjacentHTML('afterbegin') to prepend content directly to
+//       editorIframe.contentDocument.body
+//     - Dispatch 'input' event to trigger Neurons' change detection
+//     - NO ExtJS access required — bypasses the window.Ext availability issue
 //
-// All v1.31 changes retained: CETL→CASL, signature removal after "Best,"
+//   Retained from v1.31/v1.32:
+//     - elementToProof wrapper with font-size: 12pt (matches Neurons formatting)
+//     - CETL → CASL branding
+//     - Signature removal (ends at "Best,")
 //
 // All v1.30 functionality retained: KB search with bare numeric href handling,
 // Canvas Community search, minimize/restore, image drop, citations panel.
 
-// ── CHANGES IN v1.31 ─────────────────────────────────────────────────────────
-//
-// BUG FIX — Inserted content disappears when Save is clicked (ATTEMPTED FIX):
-//   Diagnostics revealed: insertAdjacentHTML modifies DOM only, not ExtJS state.
-//   Neurons saves from getValue(), not DOM. Attempted to use setValue() but
-//   contentWindow.Ext was inaccessible. Fix deferred to v1.32.
-//
-// BUG FIX — Font size mismatch:
-//   Diagnostics revealed Neurons wraps all content in elementToProof div with
-//   inline style font-size: 12pt. Wrapper added to match (implemented in v1.32).
-//
-// CETL → CASL replacement:
-//   Changed all references from "CETL" to "CASL" (Center for Advancing Student
-//   Learning) across editor scaffolds, console logs, and UI text.
-//
-// Signature removal:
-//   Editor scaffolds now end at "Best," — removed signature line as Neurons
-//   auto-appends signature on send.
+// ── CHANGES IN v1.31 (attempted fix, did not work) ──────────────────────────
+// Attempted to use ExtJS setValue() instead of DOM manipulation.
+// Failed: window.Ext undefined at Insert-time despite being present at load.
+
+// ── CHANGES IN v1.30 ─────────────────────────────────────────────────────────
+// Real search integration, CETL→CASL, signature removal
 
 (function () {
   'use strict';
@@ -785,58 +773,36 @@
   }
 
   // ── INSERT DRAFT INTO NEURONS COMPOSE ────────────────────────────────────────
-  // REWRITTEN in v1.32 to use window.Ext (diagnostic confirmed this works).
-  // Ensures content persists when Neurons Save button is clicked.
+  // REVERTED to v1.23 DOM approach — ExtJS setValue() method was unreliable.
+  // This approach directly manipulates the contentEditable iframe body and
+  // dispatches an input event to trigger Neurons' change detection.
   function insertDraftAtTop(dialogEl, draftHtml) {
-    // Access ExtJS via window.Ext (confirmed available via diagnostics)
-    var Ext = window.Ext;
+    var editorIframe = getEditorIframe(dialogEl);
     
-    if (!Ext || !Ext.ComponentMgr) {
-      console.error(LOG, 'Insert failed: ExtJS not accessible via window.Ext');
-      alert('[UWM Reply Assistant] ExtJS not found. Cannot insert content.');
+    if (!editorIframe) {
+      console.error(LOG, 'Insert failed: editor iframe not found');
+      alert('[UWM Reply Assistant] Could not find the compose editor.');
       return;
     }
 
-    var emailBodyComp = null;
+    var editorBody = editorIframe.contentDocument.body;
+    var editorDoc  = editorIframe.contentDocument;
 
-    // Find EmailBody component by Name property
-    var allComps = Ext.ComponentMgr.all.map;
-    for (var id in allComps) {
-      if (allComps[id].Name === 'EmailBody') {
-        emailBodyComp = allComps[id];
-        console.log(LOG, 'Found EmailBody component, id:', emailBodyComp.id);
-        break;
-      }
-    }
-
-    if (!emailBodyComp) {
-      console.error(LOG, 'Insert failed: could not find EmailBody component');
-      alert('[UWM Reply Assistant] Could not find Neurons email body field.');
-      return;
-    }
-
-    if (typeof emailBodyComp.setValue !== 'function' || typeof emailBodyComp.getValue !== 'function') {
-      console.error(LOG, 'Insert failed: EmailBody component missing setValue/getValue methods');
-      alert('[UWM Reply Assistant] EmailBody component API unavailable.');
-      return;
-    }
-
-    // Wrap inserted content in Neurons' standard elementToProof div with explicit 12pt font
+    // Wrap inserted content in Neurons' standard elementToProof div with 12pt font
+    // (v1.31 improvement — matches Neurons' default formatting wrapper)
     var wrappedHtml = '<div class="elementToProof" style="font-family: Aptos, Aptos_EmbeddedFont, Aptos_MSFontService, Calibri, Helvetica, sans-serif; font-size: 12pt;">'
       + draftHtml
       + '</div>';
 
-    // Prepend to existing content
-    var currentValue = emailBodyComp.getValue() || '';
-    var newValue = wrappedHtml + currentValue;
+    // Insert at top of existing content (v1.23 proven approach)
+    editorBody.insertAdjacentHTML('afterbegin', wrappedHtml);
 
-    try {
-      emailBodyComp.setValue(newValue);
-      console.log(LOG, 'Draft prepended via setValue() with elementToProof wrapper — ' + draftHtml.length + ' chars inserted');
-    } catch (e) {
-      console.error(LOG, 'Insert failed during setValue():', e);
-      alert('[UWM Reply Assistant] Insert failed: ' + e.message);
-    }
+    // Fire input event to trigger Neurons' change detection
+    var evt = editorDoc.createEvent('Event');
+    evt.initEvent('input', true, true);
+    editorBody.dispatchEvent(evt);
+
+    console.log(LOG, 'Draft prepended via DOM — ' + draftHtml.length + ' chars inserted');
   }
 
   // ── POP-UP UI ─────────────────────────────────────────────────────────────────
@@ -851,7 +817,7 @@
           '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#7db3e8" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>' +
           '<span class="ra-logo">Reply Assistant</span>' +
           '<span id="uwm-ra-searching"><span class="ra-spinner"></span>Searching\u2026</span>' +
-          '<div class="ra-header-actions"><button id="uwm-ra-minimize-btn">\u2013</button><span class="ra-version">v1.32</span></div>' +
+          '<div class="ra-header-actions"><button id="uwm-ra-minimize-btn">\u2013</button><span class="ra-version">v1.33</span></div>' +
         '</div>' +
         '<div id="uwm-ra-confidence"><span class="ra-dot ra-dot-yellow"></span>' +
           '<strong style="font-size:12.5px;color:#92400e;">Searching\u2026</strong>' +
@@ -1034,7 +1000,7 @@
       return;
     }
     startObserver(); startPoller();
-    console.log(LOG, 'v1.32 initialized — 5-second grace period active');
+    console.log(LOG, 'v1.33 initialized — 5-second grace period active');
   }
 
   if (document.readyState === 'loading') { document.addEventListener('DOMContentLoaded', function () { setTimeout(init, 1000); }); }
